@@ -178,6 +178,7 @@ enum Page {
 
 enum Pairing {
     Idle,
+    PortBusy,
     Searching(Instant),
     Compare(String),
     WaitingForConfirmation,
@@ -482,7 +483,18 @@ impl Desktop {
                 }
             };
             match event {
-                Event::Status(status) => self.session_detail = Some(status),
+                Event::Status(status) => {
+                    self.session_detail = Some(status);
+                    if matches!(self.pairing, Pairing::PortBusy) {
+                        self.pairing = Pairing::Searching(Instant::now());
+                    }
+                }
+                Event::PairingPortBusy(status) => {
+                    self.session_detail = Some(status);
+                    if matches!(self.pairing, Pairing::Searching(_)) {
+                        self.pairing = Pairing::PortBusy;
+                    }
+                }
                 Event::PairCode(code) if !matches!(self.pairing, Pairing::Disconnecting) => {
                     self.pairing = Pairing::Compare(code);
                     self.detail = None;

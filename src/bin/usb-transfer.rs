@@ -216,7 +216,7 @@ fn interactive(options: Options, to: &Path) -> Result<()> {
                     in_progress = false;
                 }
                 match event {
-                    Event::Status(status) => println!("{status}"),
+                    Event::Status(status) | Event::PairingPortBusy(status) => println!("{status}"),
                     Event::PairCode(code) => {
                         println!("Pairing code: {code}");
                         println!(

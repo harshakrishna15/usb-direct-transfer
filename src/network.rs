@@ -29,6 +29,7 @@ const PROBE: &[u8; 8] = b"UDT1PING";
 const ACCEPTED: &[u8; 8] = b"UDT1OKAY";
 const CONNECT_WAIT: Duration = Duration::from_millis(450);
 const PREFACE_WAIT: Duration = Duration::from_secs(2);
+const PORT_RETRY_DELAY: Duration = Duration::from_millis(200);
 #[cfg(target_os = "linux")]
 const DIRECT_RETRY_DELAY: Duration = Duration::from_secs(2);
 type NodeId = [u8; 16];
@@ -454,11 +455,11 @@ struct Endpoint {
 }
 
 impl Endpoint {
-    fn new(address: Address) -> Result<Self> {
+    fn new(address: Address, port: u16) -> io::Result<Self> {
         let server = socket(address, Type::STREAM, Protocol::TCP)?;
         #[cfg(unix)]
         server.set_reuse_address(true)?;
-        server.bind(&address.socket(SESSION_PORT).into())?;
+        server.bind(&address.socket(port).into())?;
         server.listen(4)?;
         server.set_nonblocking(true)?;
         Ok(Self {
@@ -540,10 +541,60 @@ fn establish(address: Address, peer: IpAddr, magic: &[u8; 8], data: &[u8]) -> Re
     Ok(stream)
 }
 
-pub fn connect(
+pub(crate) enum ConnectStatus {
+    PortBusy(String),
+    Detail(String),
+}
+
+fn pairing_endpoints(
+    name: &str,
+    addresses: &[Address],
+    port: u16,
+    cancel: &AtomicBool,
+    mut status: impl FnMut(ConnectStatus),
+) -> Result<Vec<Endpoint>> {
+    let mut waiting = false;
+    'retry: while !cancel.load(Ordering::Relaxed) {
+        let mut endpoints = Vec::new();
+        let mut failures = Vec::new();
+        for &address in addresses {
+            match Endpoint::new(address, port) {
+                Ok(endpoint) => endpoints.push(endpoint),
+                Err(error) if error.kind() == io::ErrorKind::AddrInUse => {
+                    // Release any addresses already opened so a waiting
+                    // session cannot hold part of the cable's listener set.
+                    drop(endpoints);
+                    if !waiting {
+                        status(ConnectStatus::PortBusy(format!(
+                            "Pairing port {port} is in use on {name}. Pairing will continue when it is free."
+                        )));
+                        waiting = true;
+                    }
+                    thread::sleep(PORT_RETRY_DELAY);
+                    continue 'retry;
+                }
+                Err(error) => failures.push((address, error)),
+            }
+        }
+        for (address, error) in failures {
+            status(ConnectStatus::Detail(format!(
+                "Could not open {} on {name}: {error}",
+                address.ip
+            )));
+        }
+        ensure!(
+            !endpoints.is_empty(),
+            "Could not open a pairing socket on {name}. Check the cable and network adapter."
+        );
+        return Ok(endpoints);
+    }
+    bail!("Pairing canceled")
+}
+
+pub(crate) fn connect(
     options: &Options,
     cancel: &AtomicBool,
-    status: impl FnMut(String),
+    status: impl FnMut(ConnectStatus),
 ) -> Result<(TcpStream, bool)> {
     connect_mode(options, cancel, Mode::Pair, status)
 }
@@ -552,36 +603,21 @@ fn connect_mode(
     options: &Options,
     cancel: &AtomicBool,
     mode: Mode,
-    mut status: impl FnMut(String),
+    mut status: impl FnMut(ConnectStatus),
 ) -> Result<(TcpStream, bool)> {
     let (name, addresses, manual) = select(&scan()?, options)?;
-    let mut endpoints = Vec::new();
-    for address in addresses {
-        let mut endpoint = match Endpoint::new(address) {
-            Ok(endpoint) => endpoint,
-            Err(error) => {
-                status(format!(
-                    "Could not open {} on {name}: {error:#}",
-                    address.ip
-                ));
-                continue;
-            }
-        };
-        if manual.is_none() {
-            match Discovery::new(address) {
+    let mut endpoints = pairing_endpoints(&name, &addresses, SESSION_PORT, cancel, &mut status)?;
+    if manual.is_none() {
+        for endpoint in &mut endpoints {
+            match Discovery::new(endpoint.address) {
                 Ok(discovery) => endpoint.discovery = Some(discovery),
-                Err(error) => status(format!(
+                Err(error) => status(ConnectStatus::Detail(format!(
                     "Discovery unavailable for {}: {error}. Manual pairing is available.",
-                    address.ip
-                )),
+                    endpoint.address.ip
+                ))),
             }
         }
-        endpoints.push(endpoint);
     }
-    ensure!(
-        !endpoints.is_empty(),
-        "Could not bind a pairing socket to {name}. Close other copies of the app and check the cable."
-    );
     ensure!(
         manual.is_some()
             || endpoints
@@ -594,7 +630,7 @@ fn connect_mode(
         .secure_random
         .fill(&mut id)
         .map_err(|_| anyhow::anyhow!("Could not generate a discovery identifier"))?;
-    status(format!(
+    status(ConnectStatus::Detail(format!(
         "{} on {} ({})",
         if manual.is_some() {
             "Waiting for manual peer"
@@ -607,7 +643,7 @@ fn connect_mode(
             .map(|endpoint| endpoint.address.socket(SESSION_PORT).to_string())
             .collect::<Vec<_>>()
             .join(", "),
-    ));
+    )));
     let mut next_advertisement = Instant::now();
     let mut discovery_error_reported = false;
     #[cfg(target_os = "linux")]
@@ -634,9 +670,9 @@ fn connect_mode(
                 && let Err(error) = discovery.advertise(mode, id)
                 && !discovery_error_reported
             {
-                status(format!(
+                status(ConnectStatus::Detail(format!(
                     "Discovery send on {name} failed: {error}. Check the cable or use manual pairing."
-                ));
+                )));
                 discovery_error_reported = true;
             }
             for _ in 0..8 {
@@ -686,7 +722,9 @@ fn connect_mode(
                     break;
                 }
                 if let Ok(stream) = establish(address, peer, mode.manual(), &[]) {
-                    status(format!("Connected directly to the cable peer on {name}."));
+                    status(ConnectStatus::Detail(format!(
+                        "Connected directly to the cable peer on {name}."
+                    )));
                     return Ok((stream, true));
                 }
             }
@@ -707,7 +745,10 @@ pub fn benchmark(
         (MIB..=16 * 1024 * MIB).contains(&bytes),
         "Benchmark size must be between 1 MiB and 16 GiB"
     );
-    let (mut stream, initiator) = connect_mode(options, cancel, Mode::Benchmark, &mut status)?;
+    let (mut stream, initiator) = connect_mode(options, cancel, Mode::Benchmark, |update| {
+        let (ConnectStatus::Detail(message) | ConnectStatus::PortBusy(message)) = update;
+        status(message);
+    })?;
     let _link = watch(&stream)?;
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
@@ -1584,6 +1625,63 @@ mod tests {
             {"dst":"fe80::2","lladdr":"02:00:00:00:00:02","state":["REACHABLE"]}
         ]"#;
         assert!(direct_peers(ambiguous, [ipv6, ipv4].into_iter()).is_empty());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn busy_pairing_ports_can_be_retried_or_canceled() -> Result<()> {
+        let interface = if cfg!(target_os = "linux") {
+            c"lo"
+        } else {
+            c"lo0"
+        };
+        let index = unsafe { libc::if_nametoindex(interface.as_ptr()) };
+        assert_ne!(index, 0);
+        let address = Address {
+            ip: Ipv4Addr::LOCALHOST.into(),
+            prefix: 8,
+            index,
+        };
+        for should_cancel in [false, true] {
+            let owner = Endpoint::new(address, 0)?;
+            let port = owner.listener.local_addr()?.port();
+            let cancel = AtomicBool::new(false);
+            let (notify, waiting) = mpsc::channel();
+            let (finish, finished) = mpsc::channel();
+            let cancel_flag = &cancel;
+            thread::scope(|scope| -> Result<()> {
+                scope.spawn(move || {
+                    let endpoints =
+                        pairing_endpoints("test cable", &[address], port, cancel_flag, |status| {
+                            if let ConnectStatus::PortBusy(message) = status {
+                                let _ = notify.send(message);
+                            }
+                        });
+                    let _ = finish.send(endpoints);
+                });
+                let notice = waiting.recv_timeout(Duration::from_secs(3));
+                if notice.is_err() || should_cancel {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+                let notice =
+                    notice.context("The second pairing attempt did not report a busy port")?;
+                assert!(notice.contains(&port.to_string()));
+
+                // Keep the first session's listener alive in the cancel case.
+                let owner = should_cancel.then_some(owner);
+                let result = finished.recv_timeout(Duration::from_secs(3));
+                cancel.store(true, Ordering::Relaxed);
+                let result = result.context("The waiting pairing attempt did not finish")?;
+                if let Some(owner) = owner {
+                    assert_eq!(result.err().unwrap().to_string(), "Pairing canceled");
+                    assert!(TcpStream::connect(owner.listener.local_addr()?).is_ok());
+                } else {
+                    assert_eq!(result?[0].listener.local_addr()?.port(), port);
+                }
+                Ok(())
+            })?;
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]

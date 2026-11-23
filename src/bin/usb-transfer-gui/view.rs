@@ -310,6 +310,7 @@ impl Desktop {
             Pairing::Idle if cable_ready => ("Cable connected", Some("Pair")),
             Pairing::Idle if self.connection.is_none() => ("Checking the cable…", Some("Pair")),
             Pairing::Idle => ("Connect a data cable", Some("Pair")),
+            Pairing::PortBusy => ("Pairing port in use", Some("Cancel")),
             Pairing::Searching(started) if started.elapsed() >= PAIRING_HINT_DELAY => {
                 ("Still waiting for the other computer", Some("Cancel"))
             }
@@ -489,6 +490,10 @@ impl Desktop {
             Pairing::Paired => (
                 "Ready to receive",
                 "Send files from the other computer. They’ll appear here for your approval.",
+            ),
+            Pairing::PortBusy => (
+                "Waiting to pair",
+                "Pairing will continue automatically when the port is free.",
             ),
             Pairing::Searching(started) if started.elapsed() >= PAIRING_HINT_DELAY => (
                 "Pairing the computers",

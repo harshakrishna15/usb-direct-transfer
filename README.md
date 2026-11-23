@@ -94,6 +94,8 @@ If the cable adapters are up but lack addresses on a shared subnet, assign disti
 
 Discovery uses link-local multicast on UDP 48394. Pairing and the diagnostics probe use TCP 48393. If discovery stalls on Linux, the app can try an outbound connection to a peer the system already knows on that cable. If a firewall exception is still needed, scope it to the app and the direct cable interface.
 
+If the pairing port is in use, a new attempt waits for it to become free. This applies to the desktop app and terminal commands. You can cancel the waiting attempt while the other session continues.
+
 ## Retry or discard
 
 The transfer bar shows the bytes copied and estimates the time remaining once data starts moving. **Cancel transfer** stops the cable session and retains verified staged files on the destination drive, just as unplugging does. Pair again, send the same unchanged paths in the same order, and approve the same destination. The receiver verifies staged files before reusing them and restarts only files that were unfinished or no longer match. A received folder only appears in the destination after all of its files verify.

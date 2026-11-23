@@ -35,6 +35,7 @@ pub enum Command {
 #[derive(Debug)]
 pub enum Event {
     Status(String),
+    PairingPortBusy(String),
     PairCode(String),
     Paired,
     Incoming {
@@ -129,7 +130,13 @@ pub fn start_with_notify(
         let result = (|| {
             let (stream, client) =
                 network::connect(&options, &worker_control.cancelled, |status| {
-                    emit(&updates, Event::Status(status));
+                    let event = match status {
+                        network::ConnectStatus::Detail(message) => Event::Status(message),
+                        network::ConnectStatus::PortBusy(message) => {
+                            Event::PairingPortBusy(message)
+                        }
+                    };
+                    emit(&updates, event);
                 })?;
             worker_control.attach(&stream)?;
             let _link = network::watch(&stream)?;
