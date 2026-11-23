@@ -34,9 +34,12 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id("usb-direct-transfer")
+            .with_decorations(true)
             .with_inner_size([720.0, 580.0])
             .with_min_inner_size([440.0, 480.0])
             .with_drag_and_drop(true),
+        #[cfg(target_os = "linux")]
+        event_loop_builder: gnome_window_manager(),
         ..Default::default()
     };
     eframe::run_native(
@@ -44,6 +47,31 @@ fn main() -> eframe::Result {
         options,
         Box::new(|context| Ok(Box::new(Desktop::new(context)))),
     )
+}
+
+#[cfg(target_os = "linux")]
+fn gnome_window_manager() -> Option<eframe::EventLoopBuilderHook> {
+    use winit::platform::x11::EventLoopBuilderExtX11;
+
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP").ok()?;
+    if std::env::var("XDG_SESSION_TYPE").as_deref() != Ok("wayland")
+        || !desktop
+            .split(':')
+            .any(|part| part.eq_ignore_ascii_case("GNOME"))
+    {
+        return None;
+    }
+
+    // GNOME Wayland uses client-drawn decorations for this window. With
+    // XWayland, the window manager draws the desktop's configured title bar.
+    let display = std::env::var("DISPLAY").ok()?;
+    if !display.starts_with(':') {
+        return None;
+    }
+    x11rb::connect(Some(&display)).ok()?;
+    Some(Box::new(|builder| {
+        builder.with_x11();
+    }))
 }
 
 type SaveDialog = Pin<Box<dyn Future<Output = Option<PathBuf>>>>;
