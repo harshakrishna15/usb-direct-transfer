@@ -411,16 +411,21 @@ pub fn receive(
         ..Summary::default()
     };
     let mut requests = Vec::new();
+    let mut staged_roots = Vec::new();
     let mut remaining = 0;
     let mut next_index = 0;
     let mut buffer = vec![0; CHUNK];
     for (index, root) in manifest.roots.iter().enumerate() {
         let staged_root = stage_item(&stage, index);
         let is_staged = path_exists(&staged_root)?;
-        let saved_root = match (is_staged, state.published[index].as_ref()) {
-            (true, _) => staged_root,
-            (false, Some(saved)) => directory.join(saved),
-            (false, None) => bail!("Staging data for {} is missing", display_name(&root.name)),
+        let saved_root = if is_staged {
+            staged_roots.push(index);
+            staged_root
+        } else {
+            let saved = state.published[index].as_deref().with_context(|| {
+                format!("Staging data for {} is missing", display_name(&root.name))
+            })?;
+            directory.join(saved)
         };
         for (entry, mapped) in root.entries.iter().zip(&state.paths[index]) {
             tick()?;
@@ -442,11 +447,14 @@ pub fn receive(
         }
     }
 
-    write_integer(stream, requests.len())?;
-    for (index, ..) in &requests {
-        write_integer(stream, *index)?;
+    {
+        let mut writer = io::BufWriter::new(&mut *stream);
+        write_integer(&mut writer, requests.len())?;
+        for (index, ..) in &requests {
+            write_integer(&mut writer, *index)?;
+        }
+        writer.flush()?;
     }
-    stream.flush()?;
     let mut completed = total - remaining;
     progress(completed, total);
     for (_, path, bytes, expected_hash) in requests {
@@ -468,22 +476,55 @@ pub fn receive(
         sync_directory(path.parent().context("Missing staging parent")?)?;
     }
 
-    for (index, root) in manifest.roots.iter().enumerate() {
-        preparing_pulse(stream, &mut next_pulse)?;
+    let mut tick = || preparing_pulse(stream, &mut next_pulse);
+    let mut reserved = HashSet::new();
+    let mut choices_by_name = HashMap::new();
+    for &index in &staged_roots {
+        let root = &manifest.roots[index];
         let staged_root = stage_item(&stage, index);
-        if path_exists(&staged_root)? {
-            for (entry, mapped) in root.entries.iter().zip(&state.paths[index]).rev() {
-                preparing_pulse(stream, &mut next_pulse)?;
-                let path = checked_path(&staged_root, mapped)?;
-                if entry.modified.apply(&path).is_err() {
-                    summary.skipped.push(format!(
-                        "{} (modification time could not be preserved)",
-                        wire_path(&root.name, &entry.relative)
-                    ));
-                }
+        for (entry, mapped) in root.entries.iter().zip(&state.paths[index]).rev() {
+            tick()?;
+            let path = checked_path(&staged_root, mapped)?;
+            if entry.modified.apply(&path).is_err() {
+                summary.skipped.push(format!(
+                    "{} (modification time could not be preserved)",
+                    wire_path(&root.name, &entry.relative)
+                ));
             }
-            publish(&directory, &stage, &mut state, index, root)?;
         }
+        let folder = matches!(root.entries[0].kind, Kind::Directory);
+        let choices = choices_by_name
+            .entry((compatible_name(&root.name), folder))
+            .or_insert_with_key(|(name, folder)| publication_names(name.clone(), *folder));
+        let name = unclaimed_name(
+            &directory,
+            root,
+            choices,
+            |candidate| reserved.contains(candidate),
+            &mut tick,
+        )?;
+        reserved.insert(name.clone());
+        state.published[index] = Some(name);
+    }
+    if !staged_roots.is_empty() {
+        // The journal records every destination before any staged item moves.
+        // The source's presence distinguishes planned items from published ones.
+        write_state(&stage, &state)?;
+    }
+
+    for index in staged_roots {
+        publish(
+            &directory,
+            &stage,
+            &mut state,
+            index,
+            &manifest.roots[index],
+            &mut tick,
+        )?;
+    }
+
+    for (index, root) in manifest.roots.iter().enumerate() {
+        tick()?;
         let saved = state.published[index]
             .as_deref()
             .context("Missing saved name")?;
@@ -537,10 +578,11 @@ pub fn pending(to: &Path) -> Result<Vec<Pending>> {
     for entry in fs::read_dir(base)? {
         let entry = entry?;
         let id = entry.file_name().to_string_lossy().into_owned();
-        if is_digest(&id) && is_directory(&fs::symlink_metadata(entry.path())?) {
+        let path = entry.path();
+        if is_digest(&id) && metadata_if_present(&path)?.is_some_and(|meta| is_directory(&meta)) {
             items.push(Pending {
                 id,
-                bytes: staged_bytes(&entry.path(), true)?,
+                bytes: staged_bytes(&path, true)?,
             });
         }
     }
@@ -652,35 +694,62 @@ fn validate_state(state: &State, manifest: &Manifest) -> Result<()> {
     Ok(())
 }
 
+fn publication_names(name: String, folder: bool) -> impl Iterator<Item = String> {
+    (1..=MAX_ENTRIES).map(move |copy| numbered_name(&name, folder, copy))
+}
+
+fn unclaimed_name(
+    directory: &Path,
+    root: &Root,
+    choices: impl Iterator<Item = String>,
+    reserved: impl Fn(&str) -> bool,
+    mut tick: impl FnMut() -> Result<()>,
+) -> Result<String> {
+    for name in choices {
+        tick()?;
+        if !reserved(&name) && !path_exists(&directory.join(&name))? {
+            return Ok(name);
+        }
+    }
+    bail!("Too many items share the name {}", display_name(&root.name))
+}
+
 fn publish(
     directory: &Path,
     stage: &Path,
     state: &mut State,
     index: usize,
     root: &Root,
+    mut tick: impl FnMut() -> Result<()>,
 ) -> Result<()> {
     let source = stage_item(stage, index);
-    let folder = matches!(root.entries[0].kind, Kind::Directory);
-    let base_name = compatible_name(&root.name);
-    for copy in 1..=MAX_ENTRIES {
-        let name = numbered_name(&base_name, folder, copy);
-        let destination = directory.join(&name);
-        if path_exists(&destination)? {
-            continue;
-        }
-        state.published[index] = Some(name);
-        write_state(stage, state)?;
+    let mut choices = publication_names(
+        compatible_name(&root.name),
+        matches!(root.entries[0].kind, Kind::Directory),
+    );
+    loop {
+        tick()?;
+        let destination = directory.join(
+            state.published[index]
+                .as_deref()
+                .context("Missing destination in the publication journal")?,
+        );
         match rename_noreplace(&source, &destination) {
             Ok(()) => {
                 sync_directory(directory)?;
                 sync_directory(stage)?;
                 return Ok(());
             }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                // The filesystem also detects case-equivalent names and races
+                // with other programs. Record each changed name before moving.
+                let name = unclaimed_name(directory, root, &mut choices, |_| false, &mut tick)?;
+                state.published[index] = Some(name);
+                write_state(stage, state)?;
+            }
             Err(error) => return Err(error).context("Cannot safely publish the received item"),
         }
     }
-    bail!("Too many items share the name {}", display_name(&root.name))
 }
 
 fn stage_item(stage: &Path, index: usize) -> PathBuf {
@@ -691,7 +760,11 @@ fn write_state(stage: &Path, state: &State) -> Result<()> {
     let mut temp = tempfile::Builder::new()
         .prefix(".state-")
         .tempfile_in(stage)?;
-    serde_json::to_writer(temp.as_file_mut(), state)?;
+    {
+        let mut writer = io::BufWriter::new(temp.as_file_mut());
+        serde_json::to_writer(&mut writer, state)?;
+        writer.flush()?;
+    }
     temp.as_file().sync_all()?;
     temp.persist(stage.join("state.json"))
         .map_err(|error| error.error)?;
@@ -781,14 +854,28 @@ fn remove_temporary_entries(directory: &Path, prefix: &str) -> Result<()> {
 }
 
 fn staged_bytes(path: &Path, stage_root: bool) -> Result<u64> {
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
     let mut size = 0_u64;
-    for entry in fs::read_dir(path)? {
+    for entry in entries {
         let entry = entry?;
-        if stage_root && entry.file_name() == "state.json" {
+        // Only numbered roots hold files that have passed verification.
+        if stage_root
+            && !entry
+                .file_name()
+                .as_encoded_bytes()
+                .iter()
+                .all(u8::is_ascii_digit)
+        {
             continue;
         }
         let path = entry.path();
-        let metadata = fs::symlink_metadata(&path)?;
+        let Some(metadata) = metadata_if_present(&path)? else {
+            continue;
+        };
         if is_directory(&metadata) {
             size += staged_bytes(&path, false)?;
         } else if is_regular(&metadata) {
@@ -1050,9 +1137,13 @@ fn write_integer(stream: &mut impl Write, number: usize) -> Result<()> {
 }
 
 fn path_exists(path: &Path) -> io::Result<bool> {
+    Ok(metadata_if_present(path)?.is_some())
+}
+
+fn metadata_if_present(path: &Path) -> io::Result<Option<Metadata>> {
     match fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
 }
@@ -1267,6 +1358,10 @@ mod tests {
         assert!(receive(&mut interrupted, &prepared.manifest, to.path(), |_, _| {}).is_err());
         assert_eq!(interrupted.requests(), [2, 1, 2]);
         assert!(!to.path().join("Photos (2)").exists());
+        let saved = pending(to.path())?.pop().unwrap();
+        let stage = to.path().join(STAGING_DIRECTORY).join(saved.id);
+        fs::write(stage.join(".partial-interrupted"), b"unverified bytes")?;
+        fs::write(stage.join(".state-interrupted"), b"unfinished journal")?;
         assert_eq!(pending(to.path())?[0].bytes, 5);
 
         let mut retry = Exchange::new(b"second");
@@ -1309,22 +1404,93 @@ mod tests {
         let stage = base.join(prepared.manifest.id()?);
         let mut state = initialize_stage(&base, &stage, &prepared.manifest, || Ok(()))?;
         fs::write(stage_item(&stage, 0), "a")?;
+        state.published = vec![Some("a.txt".into()), Some("b.txt".into())];
+        write_state(&stage, &state)?;
         publish(
             &directory,
             &stage,
             &mut state,
             0,
             &prepared.manifest.roots[0],
+            || Ok(()),
         )?;
 
+        fs::write(directory.join("b.txt"), "existing")?;
         let mut exchange = Exchange::new(b"b");
         receive(&mut exchange, &prepared.manifest, to.path(), |_, _| {})?;
         assert_eq!(exchange.requests(), [1, 1, PUBLISHED as u32]);
         assert_eq!(fs::read(to.path().join("a.txt"))?, b"a");
-        assert_eq!(fs::read(to.path().join("b.txt"))?, b"b");
+        assert_eq!(fs::read(to.path().join("b.txt"))?, b"existing");
+        assert_eq!(fs::read(to.path().join("b (2).txt"))?, b"b");
         assert!(!to.path().join("a (2).txt").exists());
         confirm_receipt(to.path(), &prepared.manifest)?;
         Ok(())
+    }
+
+    #[test]
+    fn updates_the_journal_if_a_planned_name_is_taken() -> Result<()> {
+        let source = tempfile::tempdir()?;
+        let file = source.path().join("file.txt");
+        fs::write(&file, "received")?;
+        let prepared = prepare(&[file])?;
+        let to = tempfile::tempdir()?;
+        let (directory, base) = staging_base(to.path(), true)?;
+        let stage = base.join(prepared.manifest.id()?);
+        let mut state = initialize_stage(&base, &stage, &prepared.manifest, || Ok(()))?;
+        fs::write(stage_item(&stage, 0), "received")?;
+        state.published[0] = Some("file.txt".into());
+        write_state(&stage, &state)?;
+        fs::write(directory.join("file.txt"), "existing")?;
+
+        publish(
+            &directory,
+            &stage,
+            &mut state,
+            0,
+            &prepared.manifest.roots[0],
+            || Ok(()),
+        )?;
+        assert_eq!(fs::read(directory.join("file.txt"))?, b"existing");
+        assert_eq!(fs::read(directory.join("file (2).txt"))?, b"received");
+
+        let mut retry = Exchange::default();
+        let summary = receive(&mut retry, &prepared.manifest, to.path(), |_, _| {})?;
+        assert_eq!(retry.requests(), [0, PUBLISHED as u32]);
+        assert_eq!(summary.renamed, ["file.txt -> file (2).txt"]);
+        assert!(!directory.join("file (3).txt").exists());
+        confirm_receipt(to.path(), &prepared.manifest)
+    }
+
+    #[test]
+    fn publishes_top_level_files_with_matching_names() -> Result<()> {
+        let source = tempfile::tempdir()?;
+        let mut files = Vec::new();
+        for (index, name) in ["photo.jpg", "photo.jpg", "Photo.jpg"]
+            .into_iter()
+            .enumerate()
+        {
+            let folder = source.path().join(index.to_string());
+            fs::create_dir(&folder)?;
+            let file = folder.join(name);
+            fs::write(&file, [b'1' + index as u8])?;
+            files.push(file);
+        }
+        let prepared = prepare(&files)?;
+        let to = tempfile::tempdir()?;
+        fs::write(to.path().join("photo.jpg"), b"existing")?;
+        let case_insensitive = to.path().join("Photo.jpg").exists();
+        let mut exchange = Exchange::new(b"123");
+        receive(&mut exchange, &prepared.manifest, to.path(), |_, _| {})?;
+        let third = if case_insensitive {
+            "Photo (4).jpg"
+        } else {
+            "Photo.jpg"
+        };
+        assert_eq!(fs::read(to.path().join("photo.jpg"))?, b"existing");
+        assert_eq!(fs::read(to.path().join("photo (2).jpg"))?, b"1");
+        assert_eq!(fs::read(to.path().join("photo (3).jpg"))?, b"2");
+        assert_eq!(fs::read(to.path().join(third))?, b"3");
+        confirm_receipt(to.path(), &prepared.manifest)
     }
 
     #[test]
