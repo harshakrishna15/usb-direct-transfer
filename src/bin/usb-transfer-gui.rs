@@ -4,15 +4,22 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::task::{Context, Poll, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
 use usb_direct_transfer::{
-    Command, Event, Interface, Options, Pending, Session, Summary, discard, doctor, interfaces,
-    pending, start,
+    Command, ConnectionMonitor, ConnectionReport, Event, Options, Pending, Session, Summary,
+    discard, pending, probe_peer, start,
 };
+
+#[path = "usb-transfer-gui/view.rs"]
+mod view;
 
 const TITLE: &str = "USB Direct Transfer";
 const DESTINATION_KEY: &str = "destination";
@@ -21,8 +28,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_app_id("usb-direct-transfer")
-            .with_inner_size([720.0, 640.0])
-            .with_min_inner_size([460.0, 440.0])
+            .with_inner_size([720.0, 580.0])
+            .with_min_inner_size([440.0, 480.0])
             .with_drag_and_drop(true),
         ..Default::default()
     };
@@ -43,9 +50,45 @@ enum Pick {
 type Dialog = Pin<Box<dyn Future<Output = Vec<PathBuf>>>>;
 
 enum Background {
-    Diagnostics(Vec<Interface>, String),
+    PeerCheck(Result<(), String>),
     Pending(PathBuf, Result<Vec<Pending>, String>),
     Discarded(PathBuf, Result<(), String>),
+}
+
+struct LiveConnection {
+    updates: Receiver<ConnectionReport>,
+    stop: Arc<AtomicBool>,
+}
+
+impl LiveConnection {
+    fn new(ctx: &egui::Context) -> Self {
+        let (tx, updates) = mpsc::sync_channel(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let cancelled = stop.clone();
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let mut monitor = ConnectionMonitor::default();
+            while !cancelled.load(Ordering::Relaxed) {
+                match tx.try_send(monitor.poll()) {
+                    Err(mpsc::TrySendError::Disconnected(_)) => break,
+                    _ => ctx.request_repaint(),
+                }
+                for _ in 0..10 {
+                    if cancelled.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(100));
+                }
+            }
+        });
+        Self { updates, stop }
+    }
+}
+
+impl Drop for LiveConnection {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
 }
 
 struct Incoming {
@@ -61,13 +104,29 @@ struct Progress {
     total: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Page {
+    Receive,
+    Send,
+    Settings,
+}
+
+enum Pairing {
+    Idle,
+    Searching,
+    Compare(String),
+    WaitingForConfirmation,
+    Paired,
+    Disconnecting,
+}
+
 struct Desktop {
     session: Option<Session>,
+    pairing: Pairing,
+    page: Page,
     interface_text: String,
     peer_text: String,
-    pairing_code: Option<String>,
-    paired: bool,
-    status: String,
+    session_detail: Option<String>,
     error: Option<String>,
     destination: Option<PathBuf>,
     queued: Vec<PathBuf>,
@@ -81,9 +140,10 @@ struct Desktop {
     confirm_discard: Option<String>,
     loading_pending: bool,
     discarding: bool,
-    diagnostics: Option<String>,
-    available: Vec<Interface>,
-    diagnosing: bool,
+    peer_check: Option<Result<(), String>>,
+    checking_peer: bool,
+    connection: Option<ConnectionReport>,
+    connection_watch: LiveConnection,
     dialog: Option<(Pick, Dialog)>,
     background_tx: Sender<Background>,
     background_rx: Receiver<Background>,
@@ -91,14 +151,15 @@ struct Desktop {
 
 impl Desktop {
     fn new(context: &eframe::CreationContext<'_>) -> Self {
+        view::configure_style(&context.egui_ctx);
         let (background_tx, background_rx) = mpsc::channel();
         let mut app = Self {
             session: None,
+            pairing: Pairing::Idle,
+            page: Page::Receive,
             interface_text: String::new(),
             peer_text: String::new(),
-            pairing_code: None,
-            paired: false,
-            status: "Connect the USB-C cable to both computers.".into(),
+            session_detail: None,
             error: None,
             destination: context
                 .storage
@@ -116,9 +177,10 @@ impl Desktop {
             confirm_discard: None,
             loading_pending: false,
             discarding: false,
-            diagnostics: None,
-            available: Vec::new(),
-            diagnosing: false,
+            peer_check: None,
+            checking_peer: false,
+            connection: None,
+            connection_watch: LiveConnection::new(&context.egui_ctx),
             dialog: None,
             background_tx,
             background_rx,
@@ -143,13 +205,12 @@ impl Desktop {
         });
     }
 
-    fn diagnose(&mut self, ctx: &egui::Context) {
+    fn check_peer(&mut self, ctx: &egui::Context) {
         let options = self.options();
-        self.diagnosing = true;
+        self.checking_peer = true;
+        self.peer_check = None;
         self.background(ctx, move || {
-            let available = interfaces().unwrap_or_default();
-            let details = doctor(&options).unwrap_or_else(|error| format!("{error:#}"));
-            Background::Diagnostics(available, details)
+            Background::PeerCheck(probe_peer(&options).map_err(|error| format!("{error:#}")))
         });
     }
 
@@ -176,12 +237,14 @@ impl Desktop {
     }
 
     fn update_background(&mut self, ctx: &egui::Context) {
+        while let Ok(report) = self.connection_watch.updates.try_recv() {
+            self.connection = Some(report);
+        }
         while let Ok(message) = self.background_rx.try_recv() {
             match message {
-                Background::Diagnostics(interfaces, details) => {
-                    self.diagnosing = false;
-                    self.available = interfaces;
-                    self.diagnostics = Some(details);
+                Background::PeerCheck(result) => {
+                    self.checking_peer = false;
+                    self.peer_check = Some(result);
                 }
                 Background::Pending(path, result) if Some(&path) == self.destination.as_ref() => {
                     self.loading_pending = false;
@@ -277,31 +340,62 @@ impl Desktop {
             self.destination.clone().unwrap_or_default(),
         ));
         self.error = None;
-        self.status = "Looking for the peer over the cable. Open Pair on both computers.".into();
+        self.session_detail = None;
+        self.pairing = Pairing::Searching;
     }
 
     fn disconnect(&mut self, ctx: &egui::Context) {
         self.session.take();
-        self.pairing_code = None;
-        self.paired = false;
+        self.pairing = Pairing::Idle;
         self.incoming = None;
         self.sending = false;
         self.receiving = false;
         self.progress = None;
-        self.status = "Disconnected. Pair again to transfer files.".into();
         self.refresh_pending(ctx);
+    }
+
+    fn request_disconnect(&mut self) {
+        if let Some(session) = &self.session {
+            session.disconnect();
+            self.pairing = Pairing::Disconnecting;
+        }
+    }
+
+    fn confirm_pairing(&mut self, matching: bool) {
+        if self.send_command(Command::Confirm(matching)) {
+            self.pairing = if matching {
+                Pairing::WaitingForConfirmation
+            } else {
+                Pairing::Disconnecting
+            };
+        }
     }
 
     fn send(&mut self, paths: Vec<PathBuf>) -> bool {
         if self.send_command(Command::Send(paths.clone())) {
             self.last_sent = paths;
-            self.status = "Preparing files for the peer to approve.".into();
             self.error = None;
             self.result = None;
             self.sending = true;
             true
         } else {
             false
+        }
+    }
+
+    fn respond_to_transfer(&mut self, accept: bool) {
+        let destination = if accept {
+            let Some(folder) = self.destination.clone() else {
+                return;
+            };
+            Some(folder)
+        } else {
+            None
+        };
+        if self.send_command(Command::Approve(destination)) {
+            self.error = None;
+            self.result = None;
+            self.receiving = true;
         }
     }
 
@@ -319,26 +413,26 @@ impl Desktop {
                 }
             };
             match event {
-                Event::Status(status) => self.status = status,
-                Event::PairCode(code) => self.pairing_code = Some(code),
+                Event::Status(status) => self.session_detail = Some(status),
+                Event::PairCode(code) if !matches!(self.pairing, Pairing::Disconnecting) => {
+                    self.pairing = Pairing::Compare(code);
+                    if self.page == Page::Settings {
+                        self.page = Page::Receive;
+                    }
+                }
+                Event::PairCode(_) => {}
                 Event::Paired => {
-                    self.paired = true;
-                    self.pairing_code = None;
-                    self.status = "Paired over the cable.".into();
+                    if !matches!(self.pairing, Pairing::Disconnecting) {
+                        self.pairing = Pairing::Paired;
+                    }
                 }
                 Event::Incoming { names, bytes } => {
                     self.incoming = Some(Incoming { names, bytes });
-                    self.status = "Review the incoming transfer.".into();
+                    self.page = Page::Receive;
                 }
                 Event::IncomingClosed { accepted } => {
                     self.incoming = None;
                     self.receiving = accepted;
-                    self.status = if accepted {
-                        "Receiving approved files."
-                    } else {
-                        "Paired over the cable."
-                    }
-                    .into();
                 }
                 Event::Progress {
                     receiving,
@@ -364,7 +458,6 @@ impl Desktop {
                         self.sending = false;
                         self.last_sent.clear();
                     }
-                    self.status = "Paired over the cable.".into();
                     if receiving {
                         self.refresh_pending(ctx);
                     }
@@ -381,306 +474,6 @@ impl Desktop {
             }
         }
     }
-
-    fn connection_ui(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal_wrapped(|ui| {
-            if self.session.is_none() {
-                if ui.button("Pair").clicked() {
-                    self.begin();
-                }
-            } else if ui.button("Disconnect").clicked() {
-                if let Some(session) = &self.session {
-                    session.disconnect();
-                }
-                self.status = "Disconnecting…".into();
-            }
-            ui.label(&self.status);
-        });
-
-        if let Some(code) = self.pairing_code.clone() {
-            ui.group(|ui| {
-                ui.label("Compare this code on both computers.");
-                ui.label(egui::RichText::new(code).monospace().heading());
-                ui.horizontal(|ui| {
-                    if ui.button("Codes match").clicked()
-                        && self.send_command(Command::Confirm(true))
-                    {
-                        self.pairing_code = None;
-                        self.status = "Waiting for the peer to confirm the code.".into();
-                    }
-                    if ui.button("Codes differ").clicked() {
-                        let _ = self.send_command(Command::Confirm(false));
-                        self.pairing_code = None;
-                        self.status = "Ending pairing.".into();
-                    }
-                });
-            });
-        }
-
-        egui::CollapsingHeader::new("Connection diagnostics").show(ui, |ui| {
-            let disconnected = self.session.is_none();
-            ui.add_enabled_ui(disconnected, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    let label = ui.label("Cable interface");
-                    ui.text_edit_singleline(&mut self.interface_text)
-                        .labelled_by(label.id)
-                        .on_hover_text("Leave blank for automatic interface selection.");
-                });
-                ui.horizontal_wrapped(|ui| {
-                    let label = ui.label("Peer address");
-                    ui.text_edit_singleline(&mut self.peer_text)
-                        .labelled_by(label.id)
-                        .on_hover_text("Leave blank for cable discovery.");
-                });
-            });
-            if ui
-                .add_enabled(!self.diagnosing, egui::Button::new("Run diagnostics"))
-                .clicked()
-            {
-                self.diagnose(ui.ctx());
-            }
-            if self.diagnosing {
-                ui.spinner();
-            }
-            for interface in &self.available {
-                ui.horizontal_wrapped(|ui| {
-                    if ui
-                        .add_enabled(disconnected, egui::Button::new(&interface.name))
-                        .clicked()
-                    {
-                        self.interface_text.clone_from(&interface.name);
-                    }
-                    ui.label(format!("{}  {}", interface.address, interface.status));
-                });
-            }
-            if let Some(details) = &self.diagnostics {
-                ui.add(egui::Label::new(details).selectable(true));
-            }
-        });
-    }
-
-    fn send_ui(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
-        ui.heading("Send");
-        let can_choose = self.dialog.is_none();
-        ui.horizontal_wrapped(|ui| {
-            if ui
-                .add_enabled(can_choose, egui::Button::new("Add files…"))
-                .clicked()
-            {
-                self.open_dialog(Pick::Files, frame);
-            }
-            if ui
-                .add_enabled(can_choose, egui::Button::new("Add folder…"))
-                .clicked()
-            {
-                self.open_dialog(Pick::Folder, frame);
-            }
-            ui.label("Drop files or folders here");
-        });
-
-        let mut remove = None;
-        for (index, path) in self.queued.iter().enumerate() {
-            ui.horizontal_wrapped(|ui| {
-                if ui
-                    .button("Remove")
-                    .on_hover_text(path.display().to_string())
-                    .clicked()
-                {
-                    remove = Some(index);
-                }
-                ui.label(display_name(path))
-                    .on_hover_text(path.display().to_string());
-            });
-        }
-        if let Some(index) = remove {
-            self.queued.remove(index);
-        }
-
-        let ready = self.paired && !self.sending && !self.receiving && self.incoming.is_none();
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    ready && !self.queued.is_empty(),
-                    egui::Button::new("Send selection"),
-                )
-                .clicked()
-                && self.send(self.queued.clone())
-            {
-                self.queued.clear();
-            }
-            if ui
-                .add_enabled(
-                    ready && !self.last_sent.is_empty(),
-                    egui::Button::new("Retry last send"),
-                )
-                .on_hover_text(
-                    "The receiver can reuse verified files by approving the same destination.",
-                )
-                .clicked()
-            {
-                self.send(self.last_sent.clone());
-            }
-        });
-    }
-
-    fn receive_ui(&mut self, ui: &mut egui::Ui, frame: &eframe::Frame) {
-        ui.heading("Receive");
-        ui.horizontal_wrapped(|ui| {
-            let label = self
-                .destination
-                .as_ref()
-                .map(|path| path.display().to_string())
-                .unwrap_or_else(|| "No receive folder selected".into());
-            if ui
-                .add_enabled(
-                    !self.receiving && !self.discarding && self.dialog.is_none(),
-                    egui::Button::new("Choose folder…"),
-                )
-                .clicked()
-            {
-                self.open_dialog(Pick::Destination, frame);
-            }
-            ui.add(egui::Label::new(label).selectable(true));
-        });
-
-        let Some(incoming) = &self.incoming else {
-            return;
-        };
-        let (accept, decline) = ui
-            .group(|ui| {
-                ui.strong(format!("Incoming transfer · {}", size(incoming.bytes)));
-                let row_height = ui.text_style_height(&egui::TextStyle::Body);
-                egui::ScrollArea::vertical()
-                    .id_salt("incoming-files")
-                    .max_height(120.0)
-                    .show_rows(ui, row_height, incoming.names.len(), |ui, range| {
-                        for name in &incoming.names[range] {
-                            ui.add(egui::Label::new(name).truncate())
-                                .on_hover_text(name);
-                        }
-                    });
-                ui.horizontal(|ui| {
-                    let accept = ui
-                        .add_enabled(
-                            self.destination.is_some()
-                                && self.dialog.is_none()
-                                && !self.discarding
-                                && !self.receiving,
-                            egui::Button::new("Accept transfer"),
-                        )
-                        .clicked();
-                    (
-                        accept,
-                        ui.add_enabled(!self.receiving, egui::Button::new("Decline"))
-                            .clicked(),
-                    )
-                })
-                .inner
-            })
-            .inner;
-        if accept && self.send_command(Command::Approve(self.destination.clone())) {
-            self.error = None;
-            self.result = None;
-            self.receiving = true;
-            self.status = "Accepting transfer…".into();
-        }
-        if decline && self.send_command(Command::Approve(None)) {
-            self.receiving = true;
-            self.status = "Declining transfer…".into();
-        }
-    }
-
-    fn pending_ui(&mut self, ui: &mut egui::Ui) {
-        egui::CollapsingHeader::new("Pending transfers").show(ui, |ui| {
-            if self.destination.is_none() {
-                ui.label("Choose a receive folder to see its saved transfers.");
-                return;
-            }
-            if ui
-                .add_enabled(!self.loading_pending && !self.discarding, egui::Button::new("Refresh"))
-                .clicked()
-            {
-                self.refresh_pending(ui.ctx());
-            }
-            if self.loading_pending || self.discarding {
-                ui.spinner();
-            } else if self.saved.is_empty() {
-                ui.label("No saved transfers in this folder.");
-            } else {
-                ui.label("Ask the peer to resend the same selection and approve this folder to reuse verified files.");
-            }
-
-            let mut discard_id = None;
-            let can_discard = !self.receiving && !self.discarding && self.incoming.is_none();
-            for item in &self.saved {
-                ui.push_id(&item.id, |ui| {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.monospace(&item.id).on_hover_text("Saved transfer ID");
-                        ui.label(size(item.bytes));
-                        if self.confirm_discard.as_ref() == Some(&item.id) {
-                            if ui.add_enabled(can_discard, egui::Button::new("Discard saved files"))
-                                .clicked()
-                            {
-                                discard_id = Some(item.id.clone());
-                            }
-                            if ui.button("Keep files").clicked() {
-                                self.confirm_discard = None;
-                            }
-                        } else if ui
-                            .add_enabled(can_discard, egui::Button::new("Discard…"))
-                            .clicked()
-                        {
-                            self.confirm_discard = Some(item.id.clone());
-                        }
-                    });
-                });
-            }
-            if let Some(id) = discard_id {
-                self.confirm_discard = None;
-                self.discard(ui.ctx(), id);
-            }
-        });
-    }
-
-    fn transfer_ui(&self, ui: &mut egui::Ui) {
-        if let Some(progress) = &self.progress {
-            let direction = if progress.receiving {
-                "Receiving"
-            } else {
-                "Sending"
-            };
-            let fraction = if progress.total == 0 {
-                1.0
-            } else {
-                (progress.done as f64 / progress.total as f64).min(1.0) as f32
-            };
-            let elapsed = progress.started.elapsed().as_secs_f64();
-            let transferred = progress.done.saturating_sub(progress.initial);
-            let speed = if elapsed > 0.05 && transferred > 0 {
-                format!(" · {}/s", size((transferred as f64 / elapsed) as u64))
-            } else {
-                String::new()
-            };
-            ui.add(egui::ProgressBar::new(fraction).text(format!(
-                "{direction} · {} of {}{speed}",
-                size(progress.done),
-                size(progress.total)
-            )));
-        }
-        if let Some((receiving, summary)) = &self.result {
-            ui.strong(if *receiving {
-                "Files verified and saved"
-            } else {
-                "Peer verified and saved files"
-            });
-            for renamed in &summary.renamed {
-                ui.label(format!("Renamed · {renamed}"));
-            }
-            for skipped in &summary.skipped {
-                ui.label(format!("Skipped · {skipped}"));
-            }
-        }
-    }
 }
 
 impl eframe::App for Desktop {
@@ -691,42 +484,21 @@ impl eframe::App for Desktop {
         if self.session.is_some() || self.dialog.is_some() {
             ctx.request_repaint_after(Duration::from_millis(60));
         }
-        self.add_paths(ctx.input(|input| {
+        let dropped: Vec<_> = ctx.input(|input| {
             input
                 .raw
                 .dropped_files
                 .iter()
                 .filter_map(|file| file.path.clone())
                 .collect()
-        }));
-        egui::TopBottomPanel::top("title").show(ctx, |ui| {
-            ui.add_space(8.0);
-            ui.heading(TITLE);
-            ui.add_space(8.0);
         });
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 8.0;
-                    self.connection_ui(ui);
-                    if let Some(error) = &self.error {
-                        ui.colored_label(ui.visuals().error_fg_color, error);
-                    }
-                    self.transfer_ui(ui);
-                    ui.separator();
-                    if self.incoming.is_some() {
-                        self.receive_ui(ui, frame);
-                        ui.separator();
-                        self.send_ui(ui, frame);
-                    } else {
-                        self.send_ui(ui, frame);
-                        ui.separator();
-                        self.receive_ui(ui, frame);
-                    }
-                    self.pending_ui(ui);
-                });
-        });
+        if !dropped.is_empty() {
+            self.add_paths(dropped);
+            if self.incoming.is_none() {
+                self.page = Page::Send;
+            }
+        }
+        self.draw(ctx, frame);
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {

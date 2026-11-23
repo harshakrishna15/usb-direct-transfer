@@ -66,11 +66,13 @@ pub struct Options {
     pub peer: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Interface {
     pub name: String,
     pub address: String,
     pub status: String,
+    pub up: bool,
+    pub ready: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +155,8 @@ impl Cable {
             name: self.name.clone(),
             address,
             status: format!("{} · {} · {state}", self.kind, self.driver),
+            up: self.up,
+            ready: self.up && !self.addresses.is_empty(),
         }
     }
 }
@@ -165,6 +169,11 @@ struct Scan {
 
 pub fn interfaces() -> Result<Vec<Interface>> {
     Ok(scan()?.cables.iter().map(Cable::view).collect())
+}
+
+pub(crate) fn diagnostic_interfaces() -> Result<(Vec<Interface>, Vec<String>)> {
+    let scan = scan()?;
+    Ok((scan.cables.iter().map(Cable::view).collect(), scan.devices))
 }
 
 fn parse_peer(text: &str, name: &str, index: u32) -> Result<IpAddr> {
@@ -259,37 +268,27 @@ fn select(scan: &Scan, options: &Options) -> Result<(String, Vec<Address>, Optio
     bail!("No ready direct USB or Thunderbolt interface. Connect the cable and run doctor.");
 }
 
+pub fn probe_peer(options: &Options) -> Result<()> {
+    let (_, addresses, peer) = select(&scan()?, options)?;
+    let peer = peer.context("A peer address is required for the probe")?;
+    establish(addresses[0], peer, PROBE, &[]).map(|_| ())
+}
+
 pub fn doctor(options: &Options) -> Result<String> {
-    let scan = scan()?;
-    let mut lines = Vec::new();
-    for cable in &scan.cables {
-        let view = cable.view();
-        let address = if view.address.is_empty() {
-            "no address"
-        } else {
-            &view.address
-        };
-        lines.push(format!("{}: {} ({address})", view.name, view.status));
-    }
-    lines.extend(scan.devices.iter().cloned());
-    if scan.cables.is_empty() {
-        lines.push("No recognized direct USB or Thunderbolt network adapter.".into());
-    }
+    let mut lines = vec![
+        crate::diagnostics::ConnectionMonitor::default()
+            .poll()
+            .text(),
+    ];
     if options
         .peer
         .as_ref()
         .is_some_and(|peer| !peer.trim().is_empty())
     {
-        let result = select(&scan, options).and_then(|(_, addresses, peer)| {
-            let peer = peer.context("A peer address is required for the probe")?;
-            establish(addresses[0], peer, PROBE, &[]).map(|_| ())
-        });
-        lines.push(match result {
+        lines.push(match probe_peer(options) {
             Ok(()) => "Peer reachable over the cable.".into(),
             Err(error) => format!("Peer probe failed: {error:#}. Open pairing on the peer and check its firewall if necessary."),
         });
-    } else {
-        lines.push("Open pairing to discover a peer, or supply its cable address for a reachability probe.".into());
     }
     Ok(lines.join("\n"))
 }

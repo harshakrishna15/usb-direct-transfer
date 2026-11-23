@@ -6,7 +6,9 @@ use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
-use usb_direct_transfer::{Command, Event, Options, benchmark, discard, doctor, pending, start};
+use usb_direct_transfer::{
+    Command, ConnectionMonitor, Event, Options, benchmark, discard, doctor, pending, start,
+};
 
 #[derive(Parser)]
 #[command(about = "Transfer files and folders over a direct USB-C cable")]
@@ -34,10 +36,25 @@ impl From<Link> for Options {
     }
 }
 
+#[derive(Args)]
+struct Diagnose {
+    #[command(flatten)]
+    link: Link,
+    /// Watch USB, Thunderbolt, and cable network changes until interrupted.
+    #[arg(long)]
+    watch: bool,
+    /// Stop watching after this many seconds.
+    #[arg(long, requires = "watch", value_parser = clap::value_parser!(u64).range(1..=3600))]
+    seconds: Option<u64>,
+    /// Save the latest report and connection activity to this file.
+    #[arg(long)]
+    report: Option<PathBuf>,
+}
+
 #[derive(Subcommand)]
 enum Action {
     /// Inspect cable interfaces and test a peer address if supplied.
-    Doctor(Link),
+    Doctor(Diagnose),
     /// Measure raw TCP goodput on the cable. Run on both computers with the same size.
     Bench {
         #[command(flatten)]
@@ -67,7 +84,7 @@ enum Action {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
-        Action::Doctor(link) => println!("{}", doctor(&link.into())?),
+        Action::Doctor(args) => diagnose(args)?,
         Action::Bench { link, mib } => {
             let result = benchmark(
                 &link.into(),
@@ -85,6 +102,48 @@ fn main() -> Result<()> {
             discard(&to, &id)?;
             println!("Discarded {id}");
         }
+    }
+    Ok(())
+}
+
+fn diagnose(args: Diagnose) -> Result<()> {
+    if !args.watch {
+        let report = doctor(&args.link.into())?;
+        if let Some(path) = args.report {
+            std::fs::write(path, &report)?;
+        }
+        println!("{report}");
+        return Ok(());
+    }
+    let options: Options = args.link.into();
+    if options.peer.is_some() || options.interface.is_some() {
+        println!("{}", doctor(&options)?);
+        println!("\nLive monitoring covers all direct cable interfaces. Peer probes run once.");
+    }
+    let mut monitor = ConnectionMonitor::default();
+    let started = Instant::now();
+    let mut previous = None;
+    println!("Watching USB and Thunderbolt connections. Reconnect the Mac; press Ctrl+C to stop.");
+    loop {
+        let report = monitor.poll().text();
+        if previous.as_ref() != Some(&report) {
+            println!("\n{report}");
+            io::stdout().flush()?;
+            if let Some(path) = &args.report {
+                std::fs::write(path, &report)?;
+            }
+            previous = Some(report);
+        }
+        let wait = if let Some(seconds) = args.seconds {
+            let remaining = Duration::from_secs(seconds).saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            remaining.min(Duration::from_secs(1))
+        } else {
+            Duration::from_secs(1)
+        };
+        thread::sleep(wait);
     }
     Ok(())
 }

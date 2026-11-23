@@ -13,7 +13,16 @@ cargo build --locked --release --bin usb-transfer
 cargo build --locked --release --features gui --bin usb-transfer-gui
 ```
 
-On macOS, run `./scripts/package-macos.sh` to create the desktop app bundle in `target/release`. On Linux, run `./target/release/usb-transfer` or `./target/release/usb-transfer-gui`. The prebuilt Linux x64 test binaries require glibc 2.34 or newer. The Linux app uses `ip` from `iproute2`. The GUI uses OpenGL and the XDG Desktop Portal file chooser provided by your desktop session. Run the app as a regular user.
+The desktop app shares the **Receive**, **Send**, and **Settings** layout on macOS and Linux. After building the GUI on a Mac, package and open it with:
+
+```sh
+./scripts/package-macos.sh
+open "target/release/USB Direct Transfer.app"
+```
+
+The [macOS desktop workflow](https://github.com/harshakrishna15/usb-direct-transfer/actions/workflows/macos.yml) also builds a ZIP for Apple silicon Macs. Download it from the successful run’s **Artifacts** section. The bundle uses an ad hoc signature for testing. Building locally is an option if macOS blocks the downloaded bundle.
+
+On Linux, run `./target/release/usb-transfer` or `./target/release/usb-transfer-gui`. The prebuilt Linux x64 test binaries require glibc 2.34 or newer. The Linux app uses `ip` from `iproute2`. The Linux GUI uses OpenGL and the XDG Desktop Portal file chooser provided by your desktop session. Run the app as a regular user.
 
 ## Check the Linux cable driver
 
@@ -29,6 +38,18 @@ lsusb -t
 Look for the Mac's Apple USB ID in `lsusb`, `Driver=cdc_ncm` in `lsusb -t`, and a ready cable interface in `doctor`. A rate of `480M` in the USB tree is USB 2.0 High-Speed. Upstream Linux 7.3 includes the Mac `05ac:1902` and `05ac:1905` entries. The `05ac:1903` entry was added separately. Distribution kernels can backport these entries, so check the driver on the actual computer. [Linux 7.3 driver](https://github.com/torvalds/linux/blob/v7.3/drivers/net/usb/cdc_ncm.c) · [MacBook Air 1903 support](https://github.com/torvalds/linux/commit/a8d0451967fc0a34c4b0c21368986a81b4e14862)
 
 If Linux lists the USB device but the cable adapter is missing, `modinfo -F alias cdc_ncm` can show which Apple IDs the installed module matches. An alias includes both the vendor and product, such as `v05ACp1902`. If the adapter exists but is down, enable it in the Linux network settings. Once both computers have usable addresses on the cable, begin pairing. The manual address setup below also works for Mac ↔ Linux.
+
+### Live connection diagnostics
+
+The desktop app shows cable status in **Send** and **Receive**. Open **Settings → Connection diagnostics** for live checks, **Connection activity**, and **Copy report**. On Linux, the checks cover Mac and Thunderbolt detection, driver binding, the network adapter, carrier, and usable IP addresses.
+
+For the same diagnostic in a terminal:
+
+```sh
+./target/release/usb-transfer doctor --watch --seconds 60 --report /tmp/usb-connection-report.txt
+```
+
+Omit `--seconds` to watch until Ctrl+C. `--report` saves the latest snapshot and up to 80 activity entries whenever the report changes. A peer address supplied with `--watch` is probed once at startup. On Linux, USB detection works even when network inspection fails; unavailable checks are marked **Unknown**. The report includes recent kernel USB/Thunderbolt history when accessible, omits USB serial-number lines, and distinguishes phones from the known Mac USB product IDs. A historical phone connection is evidence of that earlier USB data connection, rather than detection of the currently connected Mac. Changes shorter than the one-second sampling interval may only appear in kernel history. Idle controller suspension is reported as context and does not by itself establish the cause of a connection problem.
 
 ### Ubuntu 26.04 LTS with the generic 7.0 kernel
 
@@ -61,13 +82,13 @@ After rebooting, plug in the Mac and check `lsusb -t` and `usb-transfer doctor`.
 
 ## Connect and transfer
 
-1. Connect both computers directly using the cable. Run `usb-transfer doctor` on each machine or open **Connection diagnostics** in the app. Check for a ready cable interface and a usable address.
+1. Connect both computers directly using the cable. Run `usb-transfer doctor` or open **Settings → Connection diagnostics** in the app if the cable status needs attention.
 2. Start `usb-transfer pair --to "/path/to/receive-folder"` on both machines, or open both apps and choose **Pair**. The CLI folder must already exist. In the app, choose the destination when reviewing an incoming batch.
 3. Compare the pairing code on both screens. Approve on both computers only if the codes match. Pair again after unplugging or restarting.
-4. On either side, choose the files or folders to send. In the CLI use `send PATH...` with double quotes around paths containing spaces. In the app, drop items into the window or select them with the file and folder pickers.
+4. On either side, choose the files or folders to send. In the CLI use `send PATH...` with double quotes around paths containing spaces. In the app, drop items into the window or open **Send** to use the file and folder pickers.
 5. Review and approve the batch on the receiving side. The result lists renamed and skipped items. Existing items are preserved.
 
-For manual pairing, select the cable interface and enter the other computer's cable IP on **both** sides. In the CLI, use `pair --interface NAME --peer ADDRESS --to DIR`. You can omit the suffix from an IPv6 link-local address because the app uses your local cable interface to scope it. `doctor --interface NAME --peer ADDRESS` can probe the link while the other computer is waiting to pair.
+For manual pairing, open **Settings → Manual pairing**, select the cable interface, and enter the other computer's cable IP on **both** sides. In the CLI, use `pair --interface NAME --peer ADDRESS --to DIR`. You can omit the suffix from an IPv6 link-local address because the app uses your local cable interface to scope it. `doctor --interface NAME --peer ADDRESS` can probe the link while the other computer is waiting to pair.
 
 If the cable adapters are up but lack addresses on a shared subnet, assign distinct unused private IPv4 addresses to the cable adapters, for example `192.168.77.1` and `192.168.77.2` with subnet mask `255.255.255.0`. Leave the gateway blank on those adapters and use the assigned peer addresses for manual pairing. Allow Local Network access on the Mac if prompted.
 
@@ -77,7 +98,7 @@ Discovery uses link-local multicast on UDP 48394. Pairing and the diagnostics pr
 
 Unplugging retains verified staged files on the destination drive. Pair again, send the same unchanged paths in the same order, and approve the same destination. The receiver verifies staged files before reusing them and restarts only files that were unfinished or no longer match. A received folder only appears in the destination after all of its files verify.
 
-The desktop app shows pending transfers for the selected destination and can resend the last batch from the open app. In the CLI, use `pending` and `discard ID` within a paired session, or run `usb-transfer pending --to DIR` and `usb-transfer discard ID --to DIR` separately. Discard removes the local staging data for that batch.
+Open **Settings → Saved transfers** to review interrupted transfers for the selected save folder. Use **Retry last transfer** on the sending computer to resend the last batch from the open app. In the CLI, use `pending` and `discard ID` within a paired session, or run `usb-transfer pending --to DIR` and `usb-transfer discard ID --to DIR` separately. Discard removes the local staging data for that batch.
 
 ## Verification
 

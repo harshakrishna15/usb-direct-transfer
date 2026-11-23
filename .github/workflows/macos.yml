@@ -1,0 +1,41 @@
+name: macOS desktop
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "scripts/package-macos.sh"
+      - ".github/workflows/macos.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  apple-silicon:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        run: rustup update stable --no-self-update
+      - name: Run tests
+        run: cargo +stable test --locked --release --all-features
+      - name: Build and package the Apple silicon app
+        run: |
+          cargo +stable build --locked --release --features gui --bin usb-transfer-gui
+          ./scripts/package-macos.sh
+          xcrun lipo -verify_arch arm64 "target/release/USB Direct Transfer.app/Contents/MacOS/usb-transfer-gui"
+          ditto -c -k --sequesterRsrc --keepParent "target/release/USB Direct Transfer.app" \
+            "target/release/USB-Direct-Transfer-macOS-arm64.zip"
+      - name: Upload Mac app
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          path: target/release/USB-Direct-Transfer-macOS-arm64.zip
+          archive: false
+          if-no-files-found: error
