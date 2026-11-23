@@ -53,22 +53,22 @@ pub(super) fn configure_style(ctx: &egui::Context) {
         ctx.style_mut_of(theme, |style| {
             let (canvas, surface, inset, border, text, muted, accent) = match theme {
                 egui::Theme::Light => (
-                    rgb(250, 251, 253),
-                    rgb(236, 240, 248),
-                    rgb(224, 235, 255),
-                    rgb(209, 217, 232),
-                    rgb(24, 36, 59),
-                    rgb(78, 94, 120),
+                    rgb(248, 250, 252),
+                    Color32::WHITE,
+                    rgb(230, 238, 253),
+                    rgb(216, 224, 235),
+                    rgb(23, 33, 50),
+                    rgb(78, 93, 115),
                     BLUE,
                 ),
                 egui::Theme::Dark => (
-                    rgb(22, 27, 36),
-                    rgb(30, 37, 49),
-                    rgb(41, 55, 80),
-                    rgb(59, 73, 100),
-                    rgb(239, 243, 252),
-                    rgb(167, 181, 205),
-                    rgb(153, 182, 255),
+                    rgb(18, 23, 32),
+                    rgb(24, 31, 42),
+                    rgb(33, 47, 70),
+                    rgb(49, 61, 81),
+                    rgb(237, 242, 250),
+                    rgb(166, 181, 202),
+                    rgb(151, 180, 249),
                 ),
             };
             for (kind, points) in [
@@ -93,6 +93,7 @@ pub(super) fn configure_style(ctx: &egui::Context) {
             visuals.faint_bg_color = inset;
             visuals.weak_text_color = Some(muted);
             visuals.hyperlink_color = accent;
+            visuals.menu_corner_radius = 12.into();
             visuals.selection.bg_fill = BLUE;
             visuals.selection.stroke = Stroke::new(1.0_f32, Color32::WHITE);
             let widgets = &mut visuals.widgets;
@@ -129,7 +130,7 @@ impl Desktop {
         };
         let nav_frame = Frame::new()
             .fill(ctx.style().visuals.window_fill)
-            .inner_margin(egui::Margin::symmetric(margin, 10));
+            .inner_margin(egui::Margin::symmetric(margin, 8));
         egui::TopBottomPanel::top("navigation")
             .frame(nav_frame)
             .show(ctx, |ui| {
@@ -144,14 +145,26 @@ impl Desktop {
                 });
             });
 
+        let comparing = matches!(self.pairing, Pairing::Compare(_));
+        let cable_ready = self
+            .connection
+            .as_ref()
+            .is_some_and(|report| report.interfaces.iter().any(|interface| interface.ready));
+        if !comparing {
+            egui::TopBottomPanel::top("connection")
+                .show_separator_line(false)
+                .frame(
+                    Frame::new()
+                        .fill(ctx.style().visuals.panel_fill)
+                        .inner_margin(egui::Margin::symmetric(margin, 8)),
+                )
+                .show(ctx, |ui| {
+                    column(ui, |ui| self.connection_ui(ui, cable_ready))
+                });
+        }
         let panel =
-            Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(margin, 18));
+            Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(margin, 12));
         egui::CentralPanel::default().frame(panel).show(ctx, |ui| {
-            let comparing = matches!(self.pairing, Pairing::Compare(_));
-            let cable_ready = self
-                .connection
-                .as_ref()
-                .is_some_and(|report| report.interfaces.iter().any(|interface| interface.ready));
             egui::ScrollArea::vertical()
                 .id_salt((self.page, comparing, self.incoming.is_some()))
                 .auto_shrink([false, false])
@@ -161,8 +174,6 @@ impl Desktop {
                             self.pairing_code_ui(ui);
                             return;
                         }
-                        self.connection_ui(ui, cable_ready);
-                        ui.separator();
                         self.error_ui(ui);
                         if self.incoming.is_none() || self.page != Page::Receive || self.sending {
                             self.transfer_ui(ui);
@@ -289,8 +300,10 @@ impl Desktop {
         };
         let idle = matches!(self.pairing, Pairing::Idle);
         let clicked = ui
-            .horizontal(|ui| {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            .allocate_ui_with_layout(
+                vec2(ui.available_width(), 40.0),
+                Layout::right_to_left(Align::Center),
+                |ui| {
                     let clicked = match action {
                         Some(label) if idle => primary_button(ui, label, true).clicked(),
                         Some(label) => quiet_button(ui, label).clicked(),
@@ -305,12 +318,11 @@ impl Desktop {
                             _ => ui.visuals().weak_text_color(),
                         };
                         ui.painter().circle_filled(rect.center(), 3.5, color);
-                        ui.label(title);
+                        ui.add(egui::Label::new(title).truncate());
                     });
                     clicked
-                })
-                .inner
-            })
+                },
+            )
             .inner;
         if clicked {
             if idle {
@@ -326,24 +338,51 @@ impl Desktop {
         let ready = paired && !self.sending && !self.receiving && self.incoming.is_none();
         let can_choose = self.save_dialog.is_none() && self.picker.is_none();
         if self.queued.is_empty() {
-            ui.vertical_centered(|ui| {
-                ui.add_space(36.0);
-                transfer_icon(ui, Page::Send);
-                ui.add_space(7.0);
-                let label = if ui.input(|input| !input.raw.hovered_files.is_empty()) {
-                    "Drop to add your files"
-                } else {
-                    "Drop files or folders here"
-                };
-                heading(ui, label);
-                ui.add_space(7.0);
-                if primary_button(ui, "Add items…", can_choose).clicked() {
-                    self.open_picker(ui.ctx());
-                }
-            });
+            let dragging = ui.input(|input| !input.raw.hovered_files.is_empty());
+            let highlight = if dragging {
+                ui.visuals().faint_bg_color
+            } else {
+                Color32::TRANSPARENT
+            };
+            Frame::new()
+                .fill(highlight)
+                .corner_radius(12)
+                .show(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(30.0);
+                        transfer_icon(ui, Page::Send);
+                        ui.add_space(8.0);
+                        heading(
+                            ui,
+                            if dragging {
+                                "Drop to add items"
+                            } else {
+                                "Send files and folders"
+                            },
+                        );
+                        ui.weak("Drop items here, or choose them below.");
+                        ui.add_space(8.0);
+                        if primary_button(ui, "Add items…", can_choose).clicked() {
+                            self.open_picker(ui.ctx());
+                        }
+                        ui.add_space(24.0);
+                    });
+                });
         } else {
-            ui.add_space(8.0);
-            heading(ui, &format!("{} selected", item_count(self.queued.len())));
+            ui.horizontal(|ui| {
+                heading(ui, &format!("{} selected", item_count(self.queued.len())));
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if ui
+                        .add_enabled(
+                            can_choose,
+                            egui::Button::new("Add items…").frame_when_inactive(false),
+                        )
+                        .clicked()
+                    {
+                        self.open_picker(ui.ctx());
+                    }
+                });
+            });
             let mut remove = None;
             let row_height = ui.spacing().interact_size.y;
             let list_height = 4.0 * row_height + 3.0 * ui.spacing().item_spacing.y;
@@ -376,25 +415,21 @@ impl Desktop {
                 self.queued.shift_remove_index(index);
             }
             let count = self.queued.len();
-            ui.horizontal_wrapped(|ui| {
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 let send_label = format!("Send {}", item_count(count));
                 if primary_button(ui, &send_label, ready && count > 0 && can_choose).clicked()
                     && self.send(self.queued.iter().cloned().collect())
                 {
                     self.queued.clear();
                 }
-                if ui
-                    .add_enabled(can_choose, egui::Button::new("Add items…"))
-                    .clicked()
-                {
-                    self.open_picker(ui.ctx());
-                }
+                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                    if self.incoming.is_some() {
+                        ui.weak("Review the incoming transfer in Receive.");
+                    } else if !paired && count > 0 {
+                        ui.weak("Choose Pair on both computers to send.");
+                    }
+                });
             });
-            if self.incoming.is_some() {
-                ui.weak("Review the incoming transfer in Receive.");
-            } else if !paired && count > 0 {
-                ui.weak("Choose Pair on both computers to send.");
-            }
         }
         if !self.last_sent.is_empty() && !self.sending && !self.receiving {
             ui.horizontal_wrapped(|ui| {
@@ -418,9 +453,11 @@ impl Desktop {
     }
 
     fn receive_ui(&mut self, ui: &mut Ui, frame: &eframe::Frame, cable_ready: bool) {
-        if !self.receiving {
-            ui.vertical_centered(|ui| {
-                ui.add_space(35.0);
+        if self.receiving {
+            return;
+        }
+        ui.vertical_centered(|ui| {
+                ui.add_space(30.0);
                 transfer_icon(ui, Page::Receive);
                 ui.add_space(7.0);
                 let (title, detail) = match self.pairing {
@@ -436,45 +473,29 @@ impl Desktop {
                 };
                 heading(ui, title);
                 ui.weak(detail);
-                ui.add_space(32.0);
-            });
-            ui.separator();
-        }
+                ui.add_space(24.0);
+        });
         self.save_folder_ui(ui, frame);
     }
 
     fn save_folder_ui(&mut self, ui: &mut Ui, frame: &eframe::Frame) {
         let can_choose = self.save_dialog.is_none() && !self.receiving && !self.discarding;
-        let clicked = ui
-            .horizontal(|ui| {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let label = if self.destination.is_some() {
-                        "Change…"
-                    } else {
-                        "Choose…"
-                    };
-                    let clicked = ui
-                        .add_enabled(can_choose, egui::Button::new(label))
-                        .on_hover_text("Choose where to save incoming files")
-                        .clicked();
-                    ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                        ui.label(RichText::new("Save folder").strong());
-                        if let Some(folder) = &self.destination {
-                            ui.add(
-                                egui::Label::new(RichText::new(display_name(folder)).weak())
-                                    .truncate(),
-                            )
-                            .on_hover_text(folder.display().to_string());
-                        } else {
-                            ui.weak("Choose when files arrive");
-                        }
-                    });
-                    clicked
-                })
-                .inner
-            })
-            .inner;
-        if clicked {
+        let name = self.destination.as_deref().map(display_name);
+        if action_row(
+            ui,
+            "Save folder",
+            Some(name.as_deref().unwrap_or("Choose folder")),
+            can_choose,
+        )
+        .on_hover_ui(|ui| {
+            if let Some(folder) = &self.destination {
+                ui.label(folder.display().to_string());
+            } else {
+                ui.label("Choose where incoming files are saved.");
+            }
+        })
+        .clicked()
+        {
             self.choose_save_folder(frame);
         }
     }
@@ -511,7 +532,7 @@ impl Desktop {
             && !self.receiving
             && !self.discarding
             && matches!(self.pairing, Pairing::Paired);
-        ui.horizontal_wrapped(|ui| {
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             let label = if has_folder {
                 "Accept transfer"
             } else {
@@ -525,7 +546,10 @@ impl Desktop {
                 }
             }
             if ui
-                .add_enabled(can_respond, egui::Button::new("Decline"))
+                .add_enabled(
+                    can_respond,
+                    egui::Button::new("Decline").frame_when_inactive(false),
+                )
                 .clicked()
             {
                 self.respond_to_transfer(false);
@@ -621,7 +645,7 @@ impl Desktop {
         if !stopping && let Some(progress) = &self.progress {
             transfer_progress(ui, progress);
         }
-        ui.separator();
+        ui.add_space(12.0);
     }
 
     fn error_ui(&mut self, ui: &mut Ui) {
@@ -658,20 +682,24 @@ impl Desktop {
     }
 
     fn settings_ui(&mut self, ui: &mut Ui, frame: &eframe::Frame) {
-        ui.add_space(8.0);
         heading(ui, "Receiving");
         self.save_folder_ui(ui, frame);
-        if quiet_button(ui, "Saved transfers…").clicked() {
+        let saved =
+            (!self.saved.is_empty() && !self.loading_pending).then(|| self.saved.len().to_string());
+        if action_row(ui, "Saved transfers", saved.as_deref(), true).clicked() {
             self.detail = Some(Detail::SavedTransfers);
         }
-        ui.add_space(10.0);
-        ui.separator();
-        ui.add_space(8.0);
+        ui.add_space(20.0);
         heading(ui, "Connection");
-        if quiet_button(ui, "Connection diagnostics…").clicked() {
+        if action_row(ui, "Connection diagnostics", None, true).clicked() {
             self.detail = Some(Detail::Connection);
         }
-        if quiet_button(ui, "Manual pairing…").clicked() {
+        let pairing = if self.interface_text.trim().is_empty() && self.peer_text.trim().is_empty() {
+            "Automatic"
+        } else {
+            "Custom"
+        };
+        if action_row(ui, "Manual pairing", Some(pairing), true).clicked() {
             self.detail = Some(Detail::ManualPairing);
         }
     }
@@ -684,6 +712,7 @@ impl Desktop {
         let width = (bounds.width() - 60.0).min(640.0);
         let height = (bounds.height() - 144.0).clamp(180.0, 450.0);
         let modal = egui::Modal::new(egui::Id::new(("detail", detail)))
+            .backdrop_color(dialog_backdrop(ctx))
             .frame(Frame::popup(&ctx.style()).inner_margin(16.0))
             .show(ctx, |ui| {
                 ui.set_width(width);
@@ -1080,16 +1109,51 @@ pub(super) fn quiet_button(ui: &mut Ui, label: &str) -> egui::Response {
     ui.add(egui::Button::new(label).frame_when_inactive(false))
 }
 
+fn action_row(ui: &mut Ui, label: &str, value: Option<&str>, enabled: bool) -> egui::Response {
+    let arrow = ui.id().with(label);
+    let icon = egui::Atom::custom(arrow, vec2(14.0, 14.0));
+    let row = if let Some(value) = value {
+        egui::Button::new((label, egui::Atom::grow(), RichText::new(value).weak(), icon))
+    } else {
+        egui::Button::new(label).right_text(icon)
+    };
+    let button = ui
+        .add_enabled_ui(enabled, |ui| {
+            row.frame_when_inactive(false)
+                .truncate()
+                .min_size(vec2(ui.available_width(), 38.0))
+                .atom_ui(ui)
+        })
+        .inner;
+    if let Some(rect) = button.rect(arrow) {
+        chevron(ui, rect, ui.visuals().weak_text_color());
+    }
+    button.response
+}
+
+pub(super) fn dialog_backdrop(ctx: &egui::Context) -> Color32 {
+    Color32::from_black_alpha(if ctx.style().visuals.dark_mode {
+        128
+    } else {
+        55
+    })
+}
+
+pub(super) fn chevron(ui: &Ui, rect: egui::Rect, color: Color32) {
+    let center = rect.center();
+    ui.painter().add(egui::Shape::line(
+        vec![
+            center + vec2(-2.0, -4.0),
+            center + vec2(2.0, 0.0),
+            center + vec2(-2.0, 4.0),
+        ],
+        Stroke::new(1.5_f32, color),
+    ));
+}
+
 fn transfer_icon(ui: &mut Ui, page: Page) {
-    let (rect, _) = ui.allocate_exact_size(vec2(68.0, 68.0), egui::Sense::hover());
-    let color = ui.visuals().hyperlink_color;
-    ui.painter().circle_filled(
-        rect.center(),
-        rect.width() / 2.0,
-        ui.visuals().faint_bg_color,
-    );
-    let symbol = egui::Rect::from_center_size(rect.center(), vec2(30.0, 30.0));
-    draw_page_icon(ui, page, symbol, color);
+    let (rect, _) = ui.allocate_exact_size(vec2(34.0, 34.0), egui::Sense::hover());
+    draw_page_icon(ui, page, rect, ui.visuals().hyperlink_color);
 }
 
 fn draw_page_icon(ui: &Ui, page: Page, rect: egui::Rect, color: Color32) {

@@ -1,4 +1,4 @@
-use super::view::{heading, item_count, primary_button, quiet_button};
+use super::view::{chevron, dialog_backdrop, heading, item_count, primary_button, quiet_button};
 use eframe::egui::{self, Align, Layout, Modal, Ui, vec2};
 use indexmap::IndexSet;
 use std::fs;
@@ -52,6 +52,7 @@ pub(super) struct FilePicker {
     home: PathBuf,
     directory: PathBuf,
     location: String,
+    editing_location: bool,
     entries: Vec<Entry>,
     selected: IndexSet<PathBuf>,
     reading: Option<Receiver<io::Result<Directory>>>,
@@ -68,6 +69,7 @@ impl FilePicker {
             home,
             directory: PathBuf::new(),
             location: String::new(),
+            editing_location: false,
             entries: Vec::new(),
             selected: IndexSet::new(),
             reading: None,
@@ -82,6 +84,7 @@ impl FilePicker {
     }
 
     fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
+        self.editing_location = false;
         self.location = path.to_string_lossy().into_owned();
         self.directory = path.clone();
         let previous_entries = std::mem::take(&mut self.entries);
@@ -103,7 +106,9 @@ impl FilePicker {
         };
         match reading.try_recv() {
             Ok(Ok(directory)) => {
-                self.location = directory.path.to_string_lossy().into_owned();
+                if !self.editing_location {
+                    self.location = directory.path.to_string_lossy().into_owned();
+                }
                 self.directory = directory.path;
                 self.entries = directory.entries;
             }
@@ -122,6 +127,7 @@ impl FilePicker {
         let width = (bounds.width() - 60.0).min(540.0);
         let list_height = (bounds.height() - 235.0).clamp(150.0, 340.0);
         let modal = Modal::new(egui::Id::new("send-picker"))
+            .backdrop_color(dialog_backdrop(ctx))
             .frame(egui::Frame::popup(&ctx.style()).inner_margin(16.0))
             .show(ctx, |ui| {
                 ui.set_width(width);
@@ -138,7 +144,11 @@ impl FilePicker {
                 );
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.weak(format!("{} selected", item_count(self.selected.len())));
+                    if self.selected.is_empty() {
+                        ui.weak("Check items to add");
+                    } else {
+                        ui.weak(format!("{} selected", item_count(self.selected.len())));
+                    }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         let add =
                             primary_button(ui, "Add items", !self.selected.is_empty()).clicked();
@@ -161,6 +171,17 @@ impl FilePicker {
     }
 
     fn navigation_ui(&mut self, ui: &mut Ui) {
+        let location_id = ui.make_persistent_id("folder-location");
+        if ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::L)) {
+            self.editing_location = true;
+            ui.memory_mut(|memory| memory.request_focus(location_id));
+        }
+        if self.editing_location
+            && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+        {
+            self.editing_location = false;
+            self.location = self.directory.to_string_lossy().into_owned();
+        }
         let parent = self
             .directory
             .parent()
@@ -168,16 +189,46 @@ impl FilePicker {
         let next = ui
             .horizontal(|ui| {
                 let up = ui
-                    .add_enabled(parent.is_some(), egui::Button::new("Up"))
+                    .add_enabled(
+                        parent.is_some(),
+                        egui::Button::new("Up").frame_when_inactive(false),
+                    )
                     .clicked();
-                let home = ui.button("Home").clicked();
-                let field = ui.add_sized(
-                    [ui.available_width() - 52.0, ui.spacing().interact_size.y],
-                    egui::TextEdit::singleline(&mut self.location).hint_text("Folder path"),
-                );
-                let go = ui.button("Go").clicked()
-                    || (field.lost_focus()
-                        && ui.input(|input| input.key_pressed(egui::Key::Enter)));
+                let home = quiet_button(ui, "Home").clicked();
+                let height = ui.spacing().interact_size.y;
+                let go = if self.editing_location {
+                    let field = ui.add_sized(
+                        [ui.available_width() - 52.0, height],
+                        egui::TextEdit::singleline(&mut self.location)
+                            .id(location_id)
+                            .hint_text("Folder path"),
+                    );
+                    ui.button("Go").clicked()
+                        || (field.lost_focus()
+                            && ui.input(|input| input.key_pressed(egui::Key::Enter)))
+                } else {
+                    let name = self
+                        .directory
+                        .file_name()
+                        .unwrap_or(self.directory.as_os_str())
+                        .to_string_lossy();
+                    let location = egui::Button::new(egui::RichText::new(name.as_ref()).strong())
+                        .right_text(egui::RichText::new("Path…").weak())
+                        .truncate()
+                        .min_size(vec2(ui.available_width(), height));
+                    if ui
+                        .add(location)
+                        .on_hover_ui(|ui| {
+                            ui.label(self.directory.display().to_string());
+                            ui.weak("Edit the folder path");
+                        })
+                        .clicked()
+                    {
+                        self.editing_location = true;
+                        ui.memory_mut(|memory| memory.request_focus(location_id));
+                    }
+                    false
+                };
                 if up {
                     parent.map(Path::to_path_buf)
                 } else if home {
@@ -220,29 +271,45 @@ impl FilePicker {
                 for entry in &self.entries[rows] {
                     ui.push_id(&entry.path, |ui| {
                         ui.allocate_ui_with_layout(
-                            vec2(ui.available_width(), row_height),
-                            Layout::right_to_left(Align::Center),
+                            vec2(ui.available_width() - 10.0, row_height),
+                            Layout::left_to_right(Align::Center),
                             |ui| {
-                                if entry.folder && quiet_button(ui, "Open").clicked() {
-                                    next = Some(entry.path.clone());
+                                let was_selected = self.selected.contains(&entry.path);
+                                let mut selected = was_selected;
+                                let checkbox = ui.checkbox(&mut selected, "");
+                                let arrow = ui.id().with("browse-folder");
+                                let name = egui::Button::new(&entry.name)
+                                    .frame_when_inactive(false)
+                                    .truncate()
+                                    .right_text(egui::Atom::custom(arrow, vec2(14.0, 14.0)))
+                                    .min_size(vec2(ui.available_width(), row_height))
+                                    .atom_ui(ui);
+                                checkbox.labelled_by(name.response.id);
+                                if entry.folder
+                                    && let Some(rect) = name.rect(arrow)
+                                {
+                                    chevron(ui, rect, ui.visuals().weak_text_color());
                                 }
-                                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-                                    let mut selected = self.selected.contains(&entry.path);
-                                    if ui
-                                        .checkbox(&mut selected, &entry.name)
-                                        .on_hover_ui(|ui| {
-                                            ui.label(entry.path.display().to_string());
-                                        })
-                                        .changed()
-                                    {
-                                        if selected {
-                                            self.selected.insert(entry.path.clone());
-                                        } else {
-                                            self.selected.shift_remove(&entry.path);
-                                        }
+                                if name
+                                    .response
+                                    .on_hover_ui(|ui| {
+                                        ui.label(entry.path.display().to_string());
+                                    })
+                                    .clicked()
+                                {
+                                    if entry.folder {
+                                        next = Some(entry.path.clone());
+                                    } else {
+                                        selected = !selected;
                                     }
-                                });
+                                }
+                                if selected != was_selected {
+                                    if selected {
+                                        self.selected.insert(entry.path.clone());
+                                    } else {
+                                        self.selected.shift_remove(&entry.path);
+                                    }
+                                }
                             },
                         );
                     });
