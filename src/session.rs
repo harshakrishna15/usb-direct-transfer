@@ -48,6 +48,7 @@ pub enum Event {
         receiving: bool,
         done: u64,
         total: u64,
+        sampled_at: Instant,
     },
     Completed {
         receiving: bool,
@@ -64,9 +65,14 @@ struct ConnectionControl {
 }
 
 impl ConnectionControl {
-    fn close(&self) {
+    fn close(&self, abort_transfer: bool) {
         self.cancelled.store(true, Ordering::Relaxed);
         if let Some(socket) = self.socket.lock().unwrap().take() {
+            if abort_transfer {
+                // Reset the connection on close so a peer blocked in a write
+                // can stop even when its TCP send buffer is full.
+                let _ = socket2::SockRef::from(&socket).set_linger(Some(Duration::ZERO));
+            }
             let _ = socket.shutdown(Shutdown::Both);
         }
     }
@@ -87,7 +93,11 @@ pub struct Session {
 
 impl Session {
     pub fn disconnect(&self) {
-        self.control.close();
+        self.control.close(false);
+    }
+
+    pub fn cancel_transfer(&self) {
+        self.control.close(true);
     }
 }
 
@@ -117,7 +127,7 @@ pub fn start(options: network::Options, destination: PathBuf) -> Session {
         {
             emit(&updates, Event::Error(format!("{error:#}")));
         }
-        worker_control.close();
+        worker_control.close(false);
         emit(&updates, Event::Disconnected);
     });
     Session {
@@ -336,6 +346,7 @@ fn progress(updates: &mpsc::Sender<Event>, receiving: bool) -> impl FnMut(u64, u
                     receiving,
                     done,
                     total,
+                    sampled_at: now,
                 },
             );
             last = Some(now);
@@ -606,14 +617,19 @@ mod tests {
         }
     }
 
-    fn connected(to: &Path) -> (Endpoint, Endpoint) {
-        let left_to = to.join("left-output");
-        let right_to = to.join("right-output");
-        fs::create_dir(&left_to).unwrap();
-        fs::create_dir(&right_to).unwrap();
+    fn loopback() -> (TcpStream, TcpStream) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (server, _) = listener.accept().unwrap();
+        (client, server)
+    }
+
+    fn connected(to: &Path) -> (Endpoint, Endpoint) {
+        let left_to = to.join("left-output");
+        let right_to = to.join("right-output");
+        fs::create_dir_all(&left_to).unwrap();
+        fs::create_dir_all(&right_to).unwrap();
+        let (client, server) = loopback();
         (
             endpoint(client, true, left_to),
             endpoint(server, false, right_to),
@@ -638,6 +654,83 @@ mod tests {
         for peer in [left, right] {
             peer.next(|event| matches!(event, Event::Paired).then_some(()));
         }
+    }
+
+    #[test]
+    fn canceling_a_download_preserves_verified_files_for_retry() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        let folder = root.join("batch");
+        let output = root.join("right-output");
+        fs::create_dir(&folder)?;
+        fs::create_dir(&output)?;
+        let first = b"already verified";
+        fs::write(folder.join("a.txt"), first)?;
+        let large_size = 4 * 1024 * 1024;
+        fs::File::create(folder.join("b.bin"))?.set_len(large_size)?;
+        let batch = transfer::prepare(std::slice::from_ref(&folder), &AtomicBool::new(false))?;
+
+        let (sender, receiver) = loopback();
+        let sender_socket = sender.try_clone()?;
+        let (finished, outcome) = mpsc::channel();
+        let control = ConnectionControl::default();
+        control.attach(&receiver)?;
+        thread::scope(|scope| -> Result<()> {
+            scope.spawn(|| {
+                let result = secure(sender, true)
+                    .and_then(|(mut stream, _)| transfer::send(&mut stream, &batch, |_, _| {}));
+                let _ = finished.send(result);
+            });
+            let (mut stream, _) = secure(receiver, false)?;
+            let received =
+                transfer::receive(&mut stream, &batch.manifest, &output, |done, total| {
+                    if done > first.len() as u64 && done < total {
+                        control.close(true);
+                    }
+                });
+            drop(stream);
+            let sent = outcome.recv_timeout(Duration::from_secs(5));
+            if sent.is_err() {
+                let _ = sender_socket.shutdown(Shutdown::Both);
+            }
+            assert!(control.cancelled.load(Ordering::Relaxed));
+            assert!(received.is_err());
+            assert!(
+                sent.context("Sender kept writing after the download was canceled")?
+                    .is_err()
+            );
+            Ok(())
+        })?;
+        assert!(!output.join("batch").exists());
+        assert_eq!(transfer::pending(&output)?[0].bytes, first.len() as u64);
+
+        let (left, right) = connected(root);
+        pair(&left, &right);
+        left.commands.send(Command::Send(vec![folder]))?;
+        right.approve_batch();
+        let reused = right.next(|event| match event {
+            Event::Progress {
+                receiving: true,
+                done,
+                ..
+            } => Some(done),
+            _ => None,
+        });
+        assert_eq!(reused, first.len() as u64);
+        right.next(|event| {
+            matches!(
+                event,
+                Event::Completed {
+                    receiving: true,
+                    ..
+                }
+            )
+            .then_some(())
+        });
+        assert_eq!(fs::read(output.join("batch/a.txt"))?, first);
+        assert_eq!(fs::metadata(output.join("batch/b.bin"))?.len(), large_size);
+        assert!(transfer::pending(&output)?.is_empty());
+        Ok(())
     }
 
     #[test]

@@ -85,7 +85,7 @@ After rebooting, plug in the Mac and check `lsusb -t` and `usb-transfer doctor`.
 1. Connect both computers directly using the cable. Run `usb-transfer doctor` or open **Settings → Connection diagnostics** in the app if the cable status needs attention.
 2. Start `usb-transfer pair --to "/path/to/receive-folder"` on both machines, or open both apps and choose **Pair**. The CLI folder must already exist. In the app, choose the destination when reviewing an incoming batch.
 3. Compare the pairing code on both screens. Approve on both computers only if the codes match. Pair again after unplugging or restarting.
-4. On either side, choose the files or folders to send. In the CLI use `send PATH...` with double quotes around paths containing spaces. In the app, drop items into the window or use **Add items** on the **Send** screen.
+4. On either side, choose the files or folders to send. In the CLI use `send PATH...` with double quotes around paths containing spaces. In the app, drop items into the window or use **Add items** on the **Send** screen to choose files and folders together.
 5. Review and approve the batch on the receiving side. The result lists renamed and skipped items. Existing items are preserved.
 
 For manual pairing, open **Settings → Manual pairing**, select the cable interface, and enter the other computer's cable IP on **both** sides. In the CLI, use `pair --interface NAME --peer ADDRESS --to DIR`. You can omit the suffix from an IPv6 link-local address because the app uses your local cable interface to scope it. `doctor --interface NAME --peer ADDRESS` can probe the link while the other computer is waiting to pair.
@@ -96,7 +96,7 @@ Discovery uses link-local multicast on UDP 48394. Pairing and the diagnostics pr
 
 ## Retry or discard
 
-Unplugging retains verified staged files on the destination drive. Pair again, send the same unchanged paths in the same order, and approve the same destination. The receiver verifies staged files before reusing them and restarts only files that were unfinished or no longer match. A received folder only appears in the destination after all of its files verify.
+The transfer bar shows the bytes copied and estimates the time remaining once data starts moving. **Cancel transfer** stops the cable session and retains verified staged files on the destination drive, just as unplugging does. Pair again, send the same unchanged paths in the same order, and approve the same destination. The receiver verifies staged files before reusing them and restarts only files that were unfinished or no longer match. A received folder only appears in the destination after all of its files verify.
 
 Open **Settings → Saved transfers** to review interrupted transfers for the selected save folder. Use **Retry last transfer** on the sending computer to resend the last batch from the open app. In the CLI, use `pending` and `discard ID` within a paired session, or run `usb-transfer pending --to DIR` and `usb-transfer discard ID --to DIR` separately. Discard removes the local staging data for that batch.
 

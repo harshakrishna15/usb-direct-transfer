@@ -18,8 +18,12 @@ use usb_direct_transfer::{
     discard, pending, probe_peer, start,
 };
 
+#[path = "usb-transfer-gui/picker.rs"]
+mod picker;
 #[path = "usb-transfer-gui/view.rs"]
 mod view;
+
+use picker::FilePicker;
 
 const TITLE: &str = "USB Direct Transfer";
 const DESTINATION_KEY: &str = "destination";
@@ -40,14 +44,7 @@ fn main() -> eframe::Result {
     )
 }
 
-#[derive(Clone, Copy)]
-enum Pick {
-    Files,
-    Folder,
-    Destination,
-}
-
-type Dialog = Pin<Box<dyn Future<Output = Vec<PathBuf>>>>;
+type SaveDialog = Pin<Box<dyn Future<Output = Option<PathBuf>>>>;
 
 enum Background {
     PeerCheck(Result<(), String>),
@@ -99,9 +96,26 @@ struct Incoming {
 struct Progress {
     receiving: bool,
     started: Instant,
+    sampled_at: Instant,
     initial: u64,
     done: u64,
     total: u64,
+}
+
+impl Progress {
+    fn rate(&self, now: Instant) -> Option<f64> {
+        let elapsed = self.sampled_at.duration_since(self.started).as_secs_f64();
+        let transferred = self.done.saturating_sub(self.initial);
+        (elapsed >= 0.3
+            && transferred > 0
+            && now.duration_since(self.sampled_at) <= Duration::from_secs(3))
+        .then(|| transferred as f64 / elapsed)
+    }
+}
+
+enum TransferResult {
+    Completed { receiving: bool, summary: Summary },
+    Canceled,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -135,7 +149,7 @@ struct Desktop {
     sending: bool,
     receiving: bool,
     progress: Option<Progress>,
-    result: Option<(bool, Summary)>,
+    result: Option<TransferResult>,
     saved: Vec<Pending>,
     confirm_discard: Option<String>,
     loading_pending: bool,
@@ -144,7 +158,9 @@ struct Desktop {
     checking_peer: bool,
     connection: Option<ConnectionReport>,
     connection_watch: LiveConnection,
-    dialog: Option<(Pick, Dialog)>,
+    save_dialog: Option<SaveDialog>,
+    picker: Option<FilePicker>,
+    picker_location: Option<PathBuf>,
     background_tx: Sender<Background>,
     background_rx: Receiver<Background>,
 }
@@ -181,7 +197,9 @@ impl Desktop {
             checking_peer: false,
             connection: None,
             connection_watch: LiveConnection::new(&context.egui_ctx),
-            dialog: None,
+            save_dialog: None,
+            picker: None,
+            picker_location: None,
             background_tx,
             background_rx,
         };
@@ -267,52 +285,39 @@ impl Desktop {
         }
     }
 
-    fn open_dialog(&mut self, pick: Pick, frame: &eframe::Frame) {
+    fn choose_save_folder(&mut self, frame: &eframe::Frame) {
         let mut dialog = rfd::AsyncFileDialog::new()
             .set_parent(frame)
-            .set_title(match pick {
-                Pick::Files => "Select files to send",
-                Pick::Folder => "Select a folder to send",
-                Pick::Destination => "Choose a receive folder",
-            });
-        if let (Pick::Destination, Some(path)) = (pick, &self.destination) {
+            .set_title("Choose a receive folder");
+        if let Some(path) = &self.destination {
             dialog = dialog.set_directory(path);
         }
-        self.dialog = Some((
-            pick,
-            Box::pin(async move {
-                let selection = match pick {
-                    Pick::Files => dialog.pick_files().await.unwrap_or_default(),
-                    Pick::Folder | Pick::Destination => {
-                        dialog.pick_folder().await.into_iter().collect()
-                    }
-                };
-                selection
-                    .into_iter()
-                    .map(|handle| handle.path().to_path_buf())
-                    .collect()
-            }),
-        ));
+        self.save_dialog = Some(Box::pin(async move {
+            dialog
+                .pick_folder()
+                .await
+                .map(|handle| handle.path().to_path_buf())
+        }));
     }
 
-    fn update_dialog(&mut self, ctx: &egui::Context) {
-        let Some((pick, dialog)) = &mut self.dialog else {
+    fn update_save_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = &mut self.save_dialog else {
             return;
         };
         let mut context = Context::from_waker(Waker::noop());
-        if let Poll::Ready(mut paths) = dialog.as_mut().poll(&mut context) {
-            if matches!(pick, Pick::Destination) {
-                if let Some(path) = paths.pop() {
-                    self.destination = Some(path);
-                    self.saved.clear();
-                    self.confirm_discard = None;
-                    self.refresh_pending(ctx);
-                }
-            } else {
-                self.add_paths(paths);
+        if let Poll::Ready(path) = dialog.as_mut().poll(&mut context) {
+            if let Some(path) = path {
+                self.destination = Some(path);
+                self.saved.clear();
+                self.confirm_discard = None;
+                self.refresh_pending(ctx);
             }
-            self.dialog = None;
+            self.save_dialog = None;
         }
+    }
+
+    fn open_picker(&mut self, ctx: &egui::Context) {
+        self.picker = Some(FilePicker::new(ctx, self.picker_location.clone()));
     }
 
     fn add_paths(&mut self, paths: Vec<PathBuf>) {
@@ -357,6 +362,14 @@ impl Desktop {
     fn request_disconnect(&mut self) {
         if let Some(session) = &self.session {
             session.disconnect();
+            self.pairing = Pairing::Disconnecting;
+        }
+    }
+
+    fn cancel_transfer(&mut self) {
+        if let Some(session) = &self.session {
+            session.cancel_transfer();
+            self.result = Some(TransferResult::Canceled);
             self.pairing = Pairing::Disconnecting;
         }
     }
@@ -438,19 +451,26 @@ impl Desktop {
                     receiving,
                     done,
                     total,
-                } => {
-                    let progress = self.progress.get_or_insert(Progress {
-                        receiving,
-                        started: Instant::now(),
-                        initial: done,
-                        done,
-                        total,
-                    });
-                    progress.done = done;
-                    progress.total = total;
-                }
+                    sampled_at,
+                } => match &mut self.progress {
+                    Some(progress) if progress.receiving == receiving => {
+                        progress.sampled_at = sampled_at;
+                        progress.done = done;
+                        progress.total = total;
+                    }
+                    _ => {
+                        self.progress = Some(Progress {
+                            receiving,
+                            started: sampled_at,
+                            sampled_at,
+                            initial: done,
+                            done,
+                            total,
+                        });
+                    }
+                },
                 Event::Completed { receiving, summary } => {
-                    self.result = Some((receiving, summary));
+                    self.result = Some(TransferResult::Completed { receiving, summary });
                     self.progress = None;
                     if receiving {
                         self.receiving = false;
@@ -480,8 +500,8 @@ impl eframe::App for Desktop {
     fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         self.update_background(ctx);
         self.update_session(ctx);
-        self.update_dialog(ctx);
-        if self.session.is_some() || self.dialog.is_some() {
+        self.update_save_dialog(ctx);
+        if self.session.is_some() || self.save_dialog.is_some() {
             ctx.request_repaint_after(Duration::from_millis(60));
         }
         let dropped: Vec<_> = ctx.input(|input| {
@@ -499,6 +519,15 @@ impl eframe::App for Desktop {
             }
         }
         self.draw(ctx, frame);
+        if let Some(picker) = self.picker.as_mut()
+            && let Some(paths) = picker.show(ctx)
+        {
+            if !paths.is_empty() {
+                self.picker_location = Some(picker.directory().to_path_buf());
+                self.add_paths(paths);
+            }
+            self.picker = None;
+        }
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
@@ -535,5 +564,31 @@ fn size(bytes: u64) -> String {
         format!("{:.1} KiB", bytes as f64 / KIB as f64)
     } else {
         format!("{bytes} B")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transfer_rate_excludes_resumed_bytes_and_waits_for_a_sample() {
+        let started = Instant::now();
+        let mut progress = Progress {
+            receiving: true,
+            started,
+            sampled_at: started,
+            initial: 800,
+            done: 800,
+            total: 1000,
+        };
+        assert_eq!(progress.rate(started), None);
+        progress.sampled_at += Duration::from_secs(2);
+        progress.done += 100;
+        assert_eq!(progress.rate(progress.sampled_at), Some(50.0));
+        assert_eq!(
+            progress.rate(progress.sampled_at + Duration::from_secs(4)),
+            None
+        );
     }
 }

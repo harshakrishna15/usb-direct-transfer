@@ -195,8 +195,8 @@ fn interactive(options: Options, to: &Path) -> Result<()> {
                 receiving,
                 done,
                 total,
+                sampled_at: now,
             }) => {
-                let now = Instant::now();
                 let (started, initial, latest) = measurement.get_or_insert((now, done, done));
                 *latest = done;
                 if done == total

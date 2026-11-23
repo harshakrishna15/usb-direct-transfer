@@ -1,8 +1,8 @@
-use super::{Desktop, Page, Pairing, Pick, display_name, nonempty, size};
+use super::{Desktop, Page, Pairing, Progress, TransferResult, display_name, nonempty, size};
 use eframe::egui::{
     self, Align, Color32, FontFamily, FontId, Frame, Layout, RichText, Stroke, TextStyle, Ui, vec2,
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use usb_direct_transfer::CheckState;
 
 const BLUE: Color32 = Color32::from_rgb(39, 85, 207);
@@ -93,40 +93,30 @@ pub(super) fn configure_style(ctx: &egui::Context) {
 
 impl Desktop {
     pub(super) fn draw(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
-        let narrow = ctx.content_rect().width() < 580.0;
+        let margin = if ctx.content_rect().width() < 580.0 {
+            20
+        } else {
+            30
+        };
         let nav_frame = Frame::new()
             .fill(ctx.style().visuals.window_fill)
-            .inner_margin(egui::Margin::symmetric(14, if narrow { 8 } else { 18 }));
-        if narrow {
-            egui::TopBottomPanel::bottom("navigation-tabs")
-                .frame(nav_frame)
-                .show(ctx, |ui| {
-                    ui.columns_const(|[receive, send, settings]| {
-                        self.nav_button(receive, Page::Receive, true);
-                        self.nav_button(send, Page::Send, true);
-                        self.nav_button(settings, Page::Settings, true);
-                    });
-                });
-        } else {
-            egui::SidePanel::left("navigation-rail")
-                .exact_width(166.0)
-                .resizable(false)
-                .frame(nav_frame)
-                .show(ctx, |ui| {
+            .inner_margin(egui::Margin::symmetric(margin, 10));
+        egui::TopBottomPanel::top("navigation")
+            .frame(nav_frame)
+            .show(ctx, |ui| {
+                column(ui, |ui| {
                     ui.horizontal(|ui| {
-                        cable_icon(ui);
-                        ui.label(RichText::new("USB Direct\nTransfer").size(17.0).strong());
+                        self.nav_button(ui, Page::Send);
+                        self.nav_button(ui, Page::Receive);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            self.nav_button(ui, Page::Settings);
+                        });
                     });
-                    ui.add_space(20.0);
-                    for page in [Page::Receive, Page::Send, Page::Settings] {
-                        self.nav_button(ui, page, false);
-                    }
                 });
-        }
+            });
 
-        let margin = if narrow { 20 } else { 30 };
         let panel =
-            Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(margin, 24));
+            Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(margin, 18));
         egui::CentralPanel::default().frame(panel).show(ctx, |ui| {
             let comparing = matches!(self.pairing, Pairing::Compare(_));
             let cable_ready = self
@@ -142,17 +132,16 @@ impl Desktop {
                             self.pairing_code_ui(ui);
                             return;
                         }
-                        ui.heading(RichText::new(self.page.label()).size(30.0).strong());
                         self.connection_ui(ui, cable_ready);
                         ui.separator();
                         self.error_ui(ui);
-                        if self.incoming.is_none() || self.page != Page::Receive {
+                        if self.incoming.is_none() || self.page != Page::Receive || self.sending {
                             self.transfer_ui(ui);
                         }
                         match self.page {
                             Page::Receive if self.incoming.is_some() => self.incoming_ui(ui, frame),
                             Page::Receive => self.receive_ui(ui, frame, cable_ready),
-                            Page::Send => self.send_ui(ui, frame),
+                            Page::Send => self.send_ui(ui),
                             Page::Settings => self.settings_ui(ui, frame),
                         }
                     })
@@ -160,7 +149,7 @@ impl Desktop {
         });
     }
 
-    fn nav_button(&mut self, ui: &mut Ui, page: Page, centered: bool) {
+    fn nav_button(&mut self, ui: &mut Ui, page: Page) {
         let label = if page == Page::Receive && self.incoming.is_some() {
             "Receive (1)"
         } else {
@@ -175,38 +164,33 @@ impl Desktop {
                 ui.visuals_mut().selection.stroke.color = color;
                 let focus = ui.visuals().widgets.hovered.bg_stroke;
                 ui.visuals_mut().widgets.inactive.bg_stroke = Stroke::NONE;
-                let layout = Layout::top_down(if centered { Align::Center } else { Align::Min });
-                ui.with_layout(layout, |ui| {
-                    let icon = ui.id().with(page);
-                    let atoms = (egui::Atom::custom(icon, vec2(18.0, 18.0)), label);
-                    let enabled = !matches!(self.pairing, Pairing::Compare(_));
-                    let width = ui.available_width();
-                    let button = ui
-                        .add_enabled_ui(enabled, |ui| {
-                            egui::Button::selectable(selected, atoms)
-                                .min_size(vec2(width, 40.0))
-                                .atom_ui(ui)
-                        })
-                        .inner;
-                    if let Some(rect) = button.rect(icon) {
-                        let icon_color = if selected {
-                            color
-                        } else {
-                            ui.visuals().text_color()
-                        };
-                        draw_page_icon(ui, page, rect, icon_color);
-                    }
-                    if button.response.has_focus() {
-                        ui.painter().rect_stroke(
-                            button.response.rect,
-                            8,
-                            focus,
-                            egui::StrokeKind::Inside,
-                        );
-                    }
-                    button.response
-                })
-                .inner
+                let icon = ui.id().with(page);
+                let atoms = (egui::Atom::custom(icon, vec2(18.0, 18.0)), label);
+                let enabled = !matches!(self.pairing, Pairing::Compare(_));
+                let button = ui
+                    .add_enabled_ui(enabled, |ui| {
+                        egui::Button::selectable(selected, atoms)
+                            .min_size(vec2(106.0, 38.0))
+                            .atom_ui(ui)
+                    })
+                    .inner;
+                if let Some(rect) = button.rect(icon) {
+                    let icon_color = if selected {
+                        color
+                    } else {
+                        ui.visuals().text_color()
+                    };
+                    draw_page_icon(ui, page, rect, icon_color);
+                }
+                if button.response.has_focus() {
+                    ui.painter().rect_stroke(
+                        button.response.rect,
+                        8,
+                        focus,
+                        egui::StrokeKind::Inside,
+                    );
+                }
+                button.response
             })
             .inner;
         if response.clicked() && self.page != page {
@@ -263,6 +247,7 @@ impl Desktop {
             }
             Pairing::Searching(_) => ("Looking for the other computer…", Some("Cancel")),
             Pairing::WaitingForConfirmation => ("Confirm on the other computer", Some("Cancel")),
+            Pairing::Paired if self.sending || self.receiving => ("Paired over the cable", None),
             Pairing::Paired => ("Paired over the cable", Some("Disconnect")),
             Pairing::Disconnecting => ("Disconnecting…", None),
             Pairing::Compare(_) => return,
@@ -301,10 +286,10 @@ impl Desktop {
         }
     }
 
-    fn send_ui(&mut self, ui: &mut Ui, frame: &eframe::Frame) {
+    fn send_ui(&mut self, ui: &mut Ui) {
         let paired = matches!(self.pairing, Pairing::Paired);
         let ready = paired && !self.sending && !self.receiving && self.incoming.is_none();
-        let can_choose = self.dialog.is_none();
+        let can_choose = self.save_dialog.is_none() && self.picker.is_none();
         if self.queued.is_empty() {
             ui.vertical_centered(|ui| {
                 ui.add_space(36.0);
@@ -317,7 +302,9 @@ impl Desktop {
                 };
                 heading(ui, label);
                 ui.add_space(7.0);
-                self.add_items_menu(ui, frame, true);
+                if primary_button(ui, "Add items…", can_choose).clicked() {
+                    self.open_picker(ui.ctx());
+                }
             });
         } else {
             ui.add_space(8.0);
@@ -361,7 +348,12 @@ impl Desktop {
                 {
                     self.queued.clear();
                 }
-                self.add_items_menu(ui, frame, false);
+                if ui
+                    .add_enabled(can_choose, egui::Button::new("Add items…"))
+                    .clicked()
+                {
+                    self.open_picker(ui.ctx());
+                }
             });
             if self.incoming.is_some() {
                 ui.weak("Review the incoming transfer in Receive.");
@@ -388,24 +380,6 @@ impl Desktop {
                 }
             });
         }
-    }
-
-    fn add_items_menu(&mut self, ui: &mut Ui, frame: &eframe::Frame, primary: bool) {
-        let enabled = self.dialog.is_none();
-        let label = "Add items…";
-        let button = if primary {
-            primary_button(ui, label, enabled)
-        } else {
-            ui.add_enabled(enabled, egui::Button::new(label))
-        };
-        egui::Popup::menu(&button).show(|ui| {
-            for (label, pick) in [("Files…", Pick::Files), ("Folder…", Pick::Folder)] {
-                if ui.button(label).clicked() {
-                    ui.close();
-                    self.open_dialog(pick, frame);
-                }
-            }
-        });
     }
 
     fn receive_ui(&mut self, ui: &mut Ui, frame: &eframe::Frame, cable_ready: bool) {
@@ -435,7 +409,7 @@ impl Desktop {
     }
 
     fn save_folder_ui(&mut self, ui: &mut Ui, frame: &eframe::Frame) {
-        let can_choose = self.dialog.is_none() && !self.receiving && !self.discarding;
+        let can_choose = self.save_dialog.is_none() && !self.receiving && !self.discarding;
         let clicked = ui
             .horizontal(|ui| {
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -466,7 +440,7 @@ impl Desktop {
             })
             .inner;
         if clicked {
-            self.open_dialog(Pick::Destination, frame);
+            self.choose_save_folder(frame);
         }
     }
 
@@ -498,7 +472,7 @@ impl Desktop {
         if has_folder {
             self.save_folder_ui(ui, frame);
         }
-        let can_respond = self.dialog.is_none()
+        let can_respond = self.save_dialog.is_none()
             && !self.receiving
             && !self.discarding
             && matches!(self.pairing, Pairing::Paired);
@@ -512,7 +486,7 @@ impl Desktop {
                 if has_folder {
                     self.respond_to_transfer(true);
                 } else {
-                    self.open_dialog(Pick::Destination, frame);
+                    self.choose_save_folder(frame);
                 }
             }
             if ui
@@ -529,86 +503,50 @@ impl Desktop {
 
     fn transfer_ui(&mut self, ui: &mut Ui) {
         if self.sending || self.receiving {
-            ui.scope(|ui| {
-                if let Some(progress) = &self.progress {
-                    heading(
-                        ui,
-                        if progress.receiving {
-                            "Receiving files"
-                        } else {
-                            "Sending files"
-                        },
-                    );
-                    let fraction = if progress.total == 0 {
-                        1.0
-                    } else {
-                        (progress.done as f64 / progress.total as f64).min(1.0) as f32
-                    };
-                    let elapsed = progress.started.elapsed().as_secs_f64();
-                    let transferred = progress.done.saturating_sub(progress.initial);
-                    let mut label = format!("{} of {}", size(progress.done), size(progress.total));
-                    if elapsed > 0.05 && transferred > 0 {
-                        label.push_str(&format!(
-                            " · {}/s",
-                            size((transferred as f64 / elapsed) as u64)
-                        ));
-                    }
-                    ui.weak(label);
-                    ui.add(
-                        egui::ProgressBar::new(fraction)
-                            .desired_height(8.0)
-                            .fill(BLUE),
-                    );
-                } else {
-                    ui.horizontal(|ui| {
-                        ui.spinner();
-                        heading(
-                            ui,
-                            if self.receiving {
-                                "Receiving files…"
-                            } else {
-                                "Preparing transfer…"
-                            },
-                        );
-                    });
-                    if self.sending && !self.receiving {
-                        ui.weak("The other computer needs to accept your transfer.");
-                    }
-                }
-            });
+            self.active_transfer_ui(ui);
             return;
         }
-        let Some((receiving, summary)) = &self.result else {
-            return;
+        let (title, summary) = match &self.result {
+            None => return,
+            Some(TransferResult::Canceled) => ("Transfer canceled", None),
+            Some(TransferResult::Completed { receiving, summary }) => (
+                if *receiving {
+                    "Transfer received"
+                } else {
+                    "Transfer sent"
+                },
+                Some(summary),
+            ),
         };
         let dismiss = ui
             .scope(|ui| {
                 let dismiss = ui
                     .horizontal(|ui| {
-                        ui.colored_label(
-                            success_color(ui),
-                            RichText::new(if *receiving {
-                                "Transfer received"
-                            } else {
-                                "Transfer sent"
-                            })
-                            .strong(),
-                        );
+                        let color = if summary.is_some() {
+                            success_color(ui)
+                        } else {
+                            ui.visuals().text_color()
+                        };
+                        ui.colored_label(color, RichText::new(title).strong());
                         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                             quiet_button(ui, "Dismiss").clicked()
                         })
                         .inner
                     })
                     .inner;
-                if !summary.renamed.is_empty() || !summary.skipped.is_empty() {
-                    egui::CollapsingHeader::new("Renamed and skipped items").show(ui, |ui| {
-                        for name in &summary.renamed {
-                            ui.label(format!("Renamed · {name}"));
-                        }
-                        for name in &summary.skipped {
-                            ui.label(format!("Skipped · {name}"));
-                        }
-                    });
+                if let Some(summary) = summary {
+                    if !summary.renamed.is_empty() || !summary.skipped.is_empty() {
+                        egui::CollapsingHeader::new("Renamed and skipped items").show(ui, |ui| {
+                            for name in &summary.renamed {
+                                ui.label(format!("Renamed · {name}"));
+                            }
+                            for name in &summary.skipped {
+                                ui.label(format!("Skipped · {name}"));
+                            }
+                        });
+                    }
+                } else if !matches!(self.pairing, Pairing::Paired) {
+                    ui.weak("Pair again to retry. The receiver can reuse verified files.");
                 }
                 dismiss
             })
@@ -616,6 +554,44 @@ impl Desktop {
         if dismiss {
             self.result = None;
         }
+    }
+
+    fn active_transfer_ui(&mut self, ui: &mut Ui) {
+        let stopping = matches!(self.pairing, Pairing::Disconnecting);
+        let title = if stopping {
+            "Stopping transfer…"
+        } else {
+            match &self.progress {
+                Some(progress) if progress.receiving => "Receiving files",
+                Some(_) => "Sending files",
+                None if self.receiving => "Preparing download…",
+                None => "Preparing transfer…",
+            }
+        };
+        let cancel = ui
+            .horizontal(|ui| {
+                if stopping || self.progress.is_none() {
+                    ui.spinner();
+                }
+                heading(ui, title);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.add_enabled(
+                        matches!(self.pairing, Pairing::Paired),
+                        egui::Button::new("Cancel transfer"),
+                    )
+                    .on_hover_text("Stops the current transfer and ends pairing.")
+                    .clicked()
+                })
+                .inner
+            })
+            .inner;
+        if cancel {
+            self.cancel_transfer();
+        }
+        if !stopping && let Some(progress) = &self.progress {
+            transfer_progress(ui, progress);
+        }
+        ui.separator();
     }
 
     fn error_ui(&mut self, ui: &mut Ui) {
@@ -851,7 +827,7 @@ impl Desktop {
             && !self.receiving
             && !self.discarding
             && !self.loading_pending
-            && self.dialog.is_none();
+            && self.save_dialog.is_none();
         let mut discard = None;
         for item in &self.saved {
             ui.push_id(&item.id, |ui| {
@@ -922,11 +898,11 @@ fn column(ui: &mut Ui, body: impl FnOnce(&mut Ui)) {
     });
 }
 
-fn heading(ui: &mut Ui, title: &str) {
+pub(super) fn heading(ui: &mut Ui, title: &str) {
     ui.heading(RichText::new(title).strong());
 }
 
-fn primary_button(ui: &mut Ui, label: &str, enabled: bool) -> egui::Response {
+pub(super) fn primary_button(ui: &mut Ui, label: &str, enabled: bool) -> egui::Response {
     ui.scope(|ui| {
         if enabled {
             let focus = ui.visuals().hyperlink_color;
@@ -952,21 +928,8 @@ fn primary_button(ui: &mut Ui, label: &str, enabled: bool) -> egui::Response {
     .inner
 }
 
-fn quiet_button(ui: &mut Ui, label: &str) -> egui::Response {
+pub(super) fn quiet_button(ui: &mut Ui, label: &str) -> egui::Response {
     ui.add(egui::Button::new(label).frame_when_inactive(false))
-}
-
-fn cable_icon(ui: &mut Ui) {
-    let (rect, _) = ui.allocate_exact_size(vec2(32.0, 32.0), egui::Sense::hover());
-    let painter = ui.painter();
-    painter.rect_filled(rect, 8, ui.visuals().faint_bg_color);
-    let center = rect.center();
-    let stroke = Stroke::new(1.5_f32, ui.visuals().hyperlink_color);
-    for x in [-6.0, 6.0] {
-        let end = egui::Rect::from_center_size(center + vec2(x, 0.0), vec2(6.0, 9.0));
-        painter.rect_stroke(end, 1, stroke, egui::StrokeKind::Inside);
-    }
-    painter.line_segment([center - vec2(3.0, 0.0), center + vec2(3.0, 0.0)], stroke);
 }
 
 fn transfer_icon(ui: &mut Ui, page: Page) {
@@ -1010,10 +973,57 @@ fn draw_page_icon(ui: &Ui, page: Page, rect: egui::Rect, color: Color32) {
     }
 }
 
-fn item_count(count: usize) -> String {
+pub(super) fn item_count(count: usize) -> String {
     if count == 1 {
         "1 item".into()
     } else {
         format!("{count} items")
+    }
+}
+
+fn transfer_progress(ui: &mut Ui, progress: &Progress) {
+    let remaining = progress.total.saturating_sub(progress.done);
+    let fraction = if remaining == 0 {
+        1.0
+    } else {
+        (progress.done as f64 / progress.total as f64) as f32
+    };
+    let percent = if remaining == 0 {
+        100
+    } else {
+        u128::from(progress.done) * 100 / u128::from(progress.total)
+    };
+    let rate = progress.rate(Instant::now());
+    let time = if remaining == 0 {
+        "Finishing transfer…".into()
+    } else if let Some(rate) = rate {
+        let seconds = (remaining as f64 / rate).ceil() as u64;
+        format!("About {} left", duration_label(seconds))
+    } else {
+        "Estimating time remaining…".into()
+    };
+    ui.strong(format!("{percent}% · {time}"));
+    ui.scope(|ui| {
+        ui.visuals_mut().extreme_bg_color = ui.visuals().faint_bg_color;
+        ui.add(
+            egui::ProgressBar::new(fraction)
+                .desired_height(12.0)
+                .fill(BLUE),
+        );
+    });
+    let mut bytes = format!("{} of {}", size(progress.done), size(progress.total));
+    if let Some(rate) = rate {
+        bytes.push_str(&format!(" · {}/s", size(rate as u64)));
+    }
+    ui.weak(bytes);
+}
+
+fn duration_label(seconds: u64) -> String {
+    if seconds >= 3600 {
+        format!("{}h {}m", seconds / 3600, seconds / 60 % 60)
+    } else if seconds >= 60 {
+        format!("{}m {}s", seconds / 60, seconds % 60)
+    } else {
+        format!("{seconds}s")
     }
 }
