@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail, ensure};
 use filetime::FileTime;
+use ring::digest;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io::{self, Read, Write};
@@ -95,7 +95,8 @@ impl Manifest {
 
     // shortcut: retry reuses an unchanged manifest; changed batches stage independently.
     fn id(&self) -> Result<String> {
-        Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(self)?)))
+        let encoded = serde_json::to_vec(self)?;
+        Ok(hex_digest(digest::digest(&digest::SHA256, &encoded)))
     }
 }
 
@@ -201,8 +202,17 @@ fn scan(
             modified,
         });
         sources.push(None);
-        let mut children = fs::read_dir(path)?.collect::<io::Result<Vec<_>>>()?;
-        children.sort_by_key(|child| child.file_name());
+        let available = MAX_ENTRIES - sources.len() - skipped.len();
+        let mut children = Vec::new();
+        for child in fs::read_dir(path)? {
+            ensure!(children.len() < available, "Too many items");
+            ensure!(
+                !cancelled.load(Ordering::Relaxed),
+                "Transfer preparation canceled"
+            );
+            children.push(child?);
+        }
+        children.sort_by_cached_key(fs::DirEntry::file_name);
         for child in children {
             let name = child.file_name();
             let Some(name) = name.to_str() else {
@@ -1069,6 +1079,17 @@ fn is_digest(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn hex_digest(digest: digest::Digest) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let bytes = digest.as_ref();
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        encoded.push(HEX[usize::from(byte >> 4)] as char);
+        encoded.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    encoded
+}
+
 fn copy_exact(
     source: &mut impl Read,
     destination: &mut impl Write,
@@ -1076,17 +1097,17 @@ fn copy_exact(
     buffer: &mut [u8],
     mut copied: impl FnMut(u64) -> Result<()>,
 ) -> Result<String> {
-    let mut digest = Sha256::new();
+    let mut hasher = digest::Context::new(&digest::SHA256);
     while bytes > 0 {
         let count = bytes.min(buffer.len() as u64) as usize;
         let chunk = &mut buffer[..count];
         source.read_exact(chunk)?;
-        digest.update(&*chunk);
+        hasher.update(chunk);
         destination.write_all(chunk)?;
         bytes -= count as u64;
         copied(count as u64)?;
     }
-    Ok(format!("{:x}", digest.finalize()))
+    Ok(hex_digest(hasher.finish()))
 }
 
 fn matches_file(
@@ -1556,6 +1577,18 @@ mod tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].bytes, 0);
         discard(to.path(), &pending[0].id)?;
+        Ok(())
+    }
+
+    #[test]
+    fn preserves_sha256_digests_written_by_previous_versions() -> Result<()> {
+        let mut input = &b"abc"[..];
+        let mut buffer = [0; 2];
+        let actual = copy_exact(&mut input, &mut io::sink(), 3, &mut buffer, |_| Ok(()))?;
+        assert_eq!(
+            actual,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
         Ok(())
     }
 

@@ -9,7 +9,7 @@ use rustls::{
     SignatureScheme, StreamOwned,
 };
 use serde::{Deserialize, Serialize};
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -318,9 +318,9 @@ fn confirm(
 }
 
 #[derive(Serialize, Deserialize)]
-enum Frame {
+enum Frame<Batch = Manifest> {
     Idle,
-    Offer(Manifest),
+    Offer(Batch),
     Waiting,
     Accept,
     Decline,
@@ -328,14 +328,34 @@ enum Frame {
     ReceiptConfirmed,
 }
 
+struct FrameBuffer(Vec<u8>);
+
+impl Write for FrameBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > MAX_FRAME + 4 - self.0.len() {
+            return Err(io::Error::other(
+                "Transfer metadata exceeds the 16 MiB batch limit. Try a smaller batch.",
+            ));
+        }
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn encode_frame(frame: impl Serialize) -> Result<Vec<u8>> {
+    let mut encoded = FrameBuffer(vec![0; 4]);
+    serde_json::to_writer(&mut encoded, &frame)?;
+    let size = (encoded.0.len() - 4) as u32;
+    encoded.0[..4].copy_from_slice(&size.to_be_bytes());
+    Ok(encoded.0)
+}
+
 fn write_frame(stream: &mut impl Write, frame: Frame) -> Result<()> {
-    let encoded = serde_json::to_vec(&frame)?;
-    ensure!(
-        encoded.len() <= MAX_FRAME,
-        "Transfer has too many entries for one batch"
-    );
-    stream.write_all(&(encoded.len() as u32).to_be_bytes())?;
-    stream.write_all(&encoded)?;
+    stream.write_all(&encode_frame(frame)?)?;
     stream.flush()?;
     Ok(())
 }
@@ -374,8 +394,11 @@ fn progress(updates: &Updates, receiving: bool) -> impl FnMut(u64, u64) + '_ {
     }
 }
 
-fn outgoing(stream: &mut impl Io, batch: Prepared, updates: &Updates) -> Result<()> {
-    write_frame(stream, Frame::Offer(batch.manifest.clone()))?;
+fn outgoing(stream: &mut impl Io, offer: PreparedOffer, updates: &Updates) -> Result<()> {
+    let PreparedOffer { batch, frame } = offer;
+    stream.write_all(&frame)?;
+    stream.flush()?;
+    drop(frame);
     loop {
         match read_frame(stream)? {
             Frame::Accept => break,
@@ -478,9 +501,14 @@ fn incoming(
     Ok(true)
 }
 
+struct PreparedOffer {
+    batch: Prepared,
+    frame: Vec<u8>,
+}
+
 #[derive(Default)]
 struct Preparation {
-    pending: Option<mpsc::Receiver<Result<Prepared>>>,
+    pending: Option<mpsc::Receiver<Result<PreparedOffer>>>,
     cancelled: Arc<AtomicBool>,
 }
 
@@ -496,13 +524,17 @@ impl Preparation {
         let (ready, prepared) = mpsc::channel();
         let cancelled = Arc::clone(&self.cancelled);
         thread::spawn(move || {
-            let _ = ready.send(transfer::prepare(&paths, &cancelled));
+            let offer = transfer::prepare(&paths, &cancelled).and_then(|batch| {
+                let frame = encode_frame(Frame::Offer(&batch.manifest))?;
+                Ok(PreparedOffer { batch, frame })
+            });
+            let _ = ready.send(offer);
         });
         self.pending = Some(prepared);
         emit(updates, Event::Status("Preparing files…".into()));
     }
 
-    fn take_ready(&mut self) -> Option<Result<Prepared>> {
+    fn take_ready(&mut self) -> Option<Result<PreparedOffer>> {
         let result = match self.pending.as_ref()?.try_recv() {
             Ok(result) => result,
             Err(mpsc::TryRecvError::Disconnected) => {
@@ -692,6 +724,52 @@ mod tests {
         for peer in [left, right] {
             peer.next(|event| matches!(event, Event::Paired).then_some(()));
         }
+    }
+
+    #[test]
+    fn oversized_offer_does_not_end_the_session() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("photos");
+        let mut folder = source.clone();
+        for _ in 0..6 {
+            folder.push("a".repeat(120));
+        }
+        fs::create_dir_all(&folder)?;
+        for index in 0..20_000 {
+            fs::File::create(folder.join(format!("photo-{index:05}.jpg")))?;
+        }
+        let small = temp.path().join("small.txt");
+        fs::write(&small, b"ready")?;
+        let (left, right) = connected(temp.path());
+        pair(&left, &right);
+
+        left.commands.send(Command::Send(vec![source]))?;
+        let error = loop {
+            match left.events.recv_timeout(Duration::from_secs(30))? {
+                Event::Error(error) => break error,
+                Event::Disconnected => bail!("The session ended before the batch was rejected"),
+                _ => {}
+            }
+        };
+        assert!(error.contains("batch"), "{error}");
+
+        left.commands.send(Command::Send(vec![small]))?;
+        right.approve_batch();
+        right.next(|event| {
+            matches!(
+                event,
+                Event::Completed {
+                    receiving: true,
+                    ..
+                }
+            )
+            .then_some(())
+        });
+        assert_eq!(
+            fs::read(temp.path().join("right-output/small.txt"))?,
+            b"ready"
+        );
+        Ok(())
     }
 
     #[test]
