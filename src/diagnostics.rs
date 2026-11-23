@@ -21,14 +21,14 @@ impl CheckState {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionCheck {
     pub name: &'static str,
     pub state: CheckState,
     pub detail: String,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionReport {
     pub summary: String,
     pub checks: Vec<ConnectionCheck>,

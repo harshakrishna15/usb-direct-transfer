@@ -1,13 +1,42 @@
-use super::{Desktop, Page, Pairing, Progress, TransferResult, display_name, nonempty, size};
+use super::{
+    Desktop, Page, Pairing, Progress, RATE_STALE_AFTER, TransferResult, display_name, nonempty,
+    size,
+};
 use eframe::egui::{
     self, Align, Color32, FontFamily, FontId, Frame, Layout, RichText, Stroke, TextStyle, Ui, vec2,
 };
 use std::time::{Duration, Instant};
-use usb_direct_transfer::CheckState;
+use usb_direct_transfer::{CheckState, ConnectionReport};
 
 const BLUE: Color32 = Color32::from_rgb(39, 85, 207);
 const CONTENT_WIDTH: f32 = 640.0;
 const PAIRING_HINT_DELAY: Duration = Duration::from_secs(8);
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum Detail {
+    SavedTransfers,
+    Connection,
+    ManualPairing,
+    TransferResult,
+}
+
+impl Detail {
+    fn title(self) -> &'static str {
+        match self {
+            Self::SavedTransfers => "Saved transfers",
+            Self::Connection => "Connection diagnostics",
+            Self::ManualPairing => "Manual pairing",
+            Self::TransferResult => "Renamed and skipped items",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(super) enum DiagnosticsTab {
+    Overview,
+    Activity,
+    Hardware,
+}
 
 impl Page {
     fn label(self) -> &'static str {
@@ -55,7 +84,7 @@ pub(super) fn configure_style(ctx: &egui::Context) {
             style.spacing.item_spacing = vec2(8.0, 8.0);
             style.spacing.interact_size.y = 32.0;
             style.spacing.button_padding = vec2(12.0, 6.0);
-            style.spacing.scroll = egui::style::ScrollStyle::solid();
+            style.spacing.scroll = egui::style::ScrollStyle::floating();
 
             let visuals = &mut style.visuals;
             visuals.panel_fill = canvas;
@@ -147,6 +176,7 @@ impl Desktop {
                     })
                 });
         });
+        self.detail_ui(ctx);
     }
 
     fn nav_button(&mut self, ui: &mut Ui, page: Page) {
@@ -236,6 +266,11 @@ impl Desktop {
     }
 
     fn connection_ui(&mut self, ui: &mut Ui, cable_ready: bool) {
+        if let Pairing::Searching(started) = self.pairing
+            && let Some(delay) = PAIRING_HINT_DELAY.checked_sub(started.elapsed())
+        {
+            ui.ctx().request_repaint_after(delay);
+        }
         let manual = !self.peer_text.trim().is_empty() || !self.interface_text.trim().is_empty();
         let (title, action) = match self.pairing {
             Pairing::Idle if manual => ("Manual pairing", Some("Pair")),
@@ -338,13 +373,13 @@ impl Desktop {
                     }
                 });
             if let Some(index) = remove {
-                self.queued.remove(index);
+                self.queued.shift_remove_index(index);
             }
             let count = self.queued.len();
             ui.horizontal_wrapped(|ui| {
                 let send_label = format!("Send {}", item_count(count));
                 if primary_button(ui, &send_label, ready && count > 0 && can_choose).clicked()
-                    && self.send(self.queued.clone())
+                    && self.send(self.queued.iter().cloned().collect())
                 {
                     self.queued.clear();
                 }
@@ -535,15 +570,10 @@ impl Desktop {
                     })
                     .inner;
                 if let Some(summary) = summary {
-                    if !summary.renamed.is_empty() || !summary.skipped.is_empty() {
-                        egui::CollapsingHeader::new("Renamed and skipped items").show(ui, |ui| {
-                            for name in &summary.renamed {
-                                ui.label(format!("Renamed · {name}"));
-                            }
-                            for name in &summary.skipped {
-                                ui.label(format!("Skipped · {name}"));
-                            }
-                        });
+                    if (!summary.renamed.is_empty() || !summary.skipped.is_empty())
+                        && quiet_button(ui, "Renamed and skipped items…").clicked()
+                    {
+                        self.detail = Some(Detail::TransferResult);
                     }
                 } else if !matches!(self.pairing, Pairing::Paired) {
                     ui.weak("Pair again to retry. The receiver can reuse verified files.");
@@ -631,22 +661,87 @@ impl Desktop {
         ui.add_space(8.0);
         heading(ui, "Receiving");
         self.save_folder_ui(ui, frame);
-        egui::CollapsingHeader::new("Saved transfers").show(ui, |ui| {
-            self.saved_transfers_ui(ui);
-        });
+        if quiet_button(ui, "Saved transfers…").clicked() {
+            self.detail = Some(Detail::SavedTransfers);
+        }
         ui.add_space(10.0);
         ui.separator();
         ui.add_space(8.0);
         heading(ui, "Connection");
-        egui::CollapsingHeader::new("Connection diagnostics").show(ui, |ui| {
-            self.connection_help_ui(ui);
-        });
-        egui::CollapsingHeader::new("Manual pairing").show(ui, |ui| {
-            self.manual_pairing_ui(ui);
-        });
+        if quiet_button(ui, "Connection diagnostics…").clicked() {
+            self.detail = Some(Detail::Connection);
+        }
+        if quiet_button(ui, "Manual pairing…").clicked() {
+            self.detail = Some(Detail::ManualPairing);
+        }
     }
 
-    fn connection_help_ui(&self, ui: &mut Ui) {
+    fn detail_ui(&mut self, ctx: &egui::Context) {
+        let Some(detail) = self.detail else {
+            return;
+        };
+        let bounds = ctx.content_rect();
+        let width = (bounds.width() - 60.0).min(640.0);
+        let height = (bounds.height() - 144.0).clamp(180.0, 450.0);
+        let modal = egui::Modal::new(egui::Id::new(("detail", detail)))
+            .frame(Frame::popup(&ctx.style()).inner_margin(16.0))
+            .show(ctx, |ui| {
+                ui.set_width(width);
+                ui.horizontal(|ui| {
+                    heading(ui, detail.title());
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        if quiet_button(ui, "Done").clicked() {
+                            ui.close();
+                        }
+                    });
+                });
+                ui.separator();
+                ui.allocate_ui_with_layout(
+                    vec2(width, height),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                        ui.set_min_height(height);
+                        match detail {
+                            Detail::Connection => self.connection_help_ui(ui, height),
+                            Detail::ManualPairing => {
+                                detail_scroll("manual", height)
+                                    .show(ui, |ui| self.manual_pairing_ui(ui));
+                            }
+                            Detail::SavedTransfers => self.saved_transfers_ui(ui, height),
+                            Detail::TransferResult => self.transfer_result_ui(ui, height),
+                        }
+                    },
+                );
+            });
+        if modal.should_close() {
+            self.detail = None;
+            self.confirm_discard = None;
+        }
+    }
+
+    fn transfer_result_ui(&self, ui: &mut Ui, height: f32) {
+        if let Some(TransferResult::Completed { summary, .. }) = &self.result {
+            let renamed = summary.renamed.len();
+            let row_height = ui.text_style_height(&TextStyle::Body);
+            detail_scroll("renamed-and-skipped", height).show_rows(
+                ui,
+                row_height,
+                renamed + summary.skipped.len(),
+                |ui, rows| {
+                    for index in rows {
+                        let line = if index < renamed {
+                            format!("Renamed · {}", summary.renamed[index])
+                        } else {
+                            format!("Skipped · {}", summary.skipped[index - renamed])
+                        };
+                        detail_line(ui, &line);
+                    }
+                },
+            );
+        }
+    }
+
+    fn connection_help_ui(&mut self, ui: &mut Ui, height: f32) {
         let Some(report) = &self.connection else {
             ui.horizontal(|ui| {
                 ui.spinner();
@@ -654,6 +749,39 @@ impl Desktop {
             });
             return;
         };
+        ui.horizontal(|ui| {
+            ui.selectable_value(
+                &mut self.diagnostics_tab,
+                DiagnosticsTab::Overview,
+                "Overview",
+            );
+            ui.selectable_value(
+                &mut self.diagnostics_tab,
+                DiagnosticsTab::Activity,
+                "Activity",
+            );
+            ui.selectable_value(
+                &mut self.diagnostics_tab,
+                DiagnosticsTab::Hardware,
+                "Hardware & kernel",
+            );
+        });
+        let list_height =
+            height - 2.0 * (ui.spacing().interact_size.y + ui.spacing().item_spacing.y);
+        let scroll = detail_scroll(self.diagnostics_tab, list_height);
+        match self.diagnostics_tab {
+            DiagnosticsTab::Overview => {
+                scroll.show(ui, |ui| self.connection_overview_ui(ui, report));
+            }
+            DiagnosticsTab::Activity => {
+                diagnostic_lines(ui, scroll.stick_to_bottom(true), &report.activity);
+            }
+            DiagnosticsTab::Hardware => diagnostic_lines(ui, scroll, &report.details),
+        }
+        self.copy_report_ui(ui, report);
+    }
+
+    fn connection_overview_ui(&self, ui: &mut Ui, report: &ConnectionReport) {
         ui.strong(&report.summary);
         for check in &report.checks {
             let color = match check.state {
@@ -673,33 +801,14 @@ impl Desktop {
                 ui.weak(format!("• {step}"));
             }
         }
-        ui.separator();
         if let Some(detail) = &self.session_detail {
-            egui::CollapsingHeader::new("Last pairing message").show(ui, |ui| {
-                ui.add(egui::Label::new(detail).selectable(true));
-            });
+            ui.separator();
+            ui.strong("Last pairing message");
+            ui.add(egui::Label::new(detail).selectable(true));
         }
-        egui::CollapsingHeader::new("Connection activity").show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt("connection-activity")
-                .max_height(130.0)
-                .stick_to_bottom(true)
-                .show(ui, |ui| {
-                    for event in &report.activity {
-                        ui.add(egui::Label::new(event).selectable(true));
-                    }
-                });
-        });
-        egui::CollapsingHeader::new("Hardware and kernel details").show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .id_salt("connection-details")
-                .max_height(200.0)
-                .show(ui, |ui| {
-                    for line in &report.details {
-                        ui.add(egui::Label::new(line).selectable(true));
-                    }
-                });
-        });
+    }
+
+    fn copy_report_ui(&self, ui: &mut Ui, report: &ConnectionReport) {
         let copy_id = ui.id().with("copied-report");
         let now = ui.input(|input| input.time);
         let copied = ui
@@ -808,7 +917,7 @@ impl Desktop {
         }
     }
 
-    fn saved_transfers_ui(&mut self, ui: &mut Ui) {
+    fn saved_transfers_ui(&mut self, ui: &mut Ui, height: f32) {
         if self.destination.is_none() {
             ui.weak("Choose the folder where an interrupted transfer was being saved.");
             return;
@@ -828,52 +937,91 @@ impl Desktop {
             && !self.discarding
             && !self.loading_pending
             && self.save_dialog.is_none();
-        let mut discard = None;
-        for item in &self.saved {
-            ui.push_id(&item.id, |ui| {
-                let short_id: String = item.id.chars().take(8).collect();
-                ui.horizontal_wrapped(|ui| {
-                    ui.strong(format!("Transfer {short_id}"))
-                        .on_hover_text(&item.id);
-                    ui.weak(format!("{} saved", size(item.bytes)));
-                    if self.confirm_discard.as_ref() != Some(&item.id)
-                        && ui
-                            .add_enabled(can_discard, egui::Button::new("Discard…"))
-                            .clicked()
-                    {
-                        self.confirm_discard = Some(item.id.clone());
-                    }
-                });
-                if self.confirm_discard.as_ref() == Some(&item.id) {
-                    ui.label("Discard this transfer’s saved progress?");
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.button("Keep").clicked() {
-                            self.confirm_discard = None;
-                        }
-                        if ui
-                            .add_enabled(can_discard, egui::Button::new("Discard progress"))
-                            .clicked()
-                        {
-                            discard = Some(item.id.clone());
-                        }
+        let row_height = ui.spacing().interact_size.y;
+        let list_height =
+            (ui.available_height() - row_height - ui.spacing().item_spacing.y).clamp(0.0, height);
+        detail_scroll("saved-batches", list_height).show_rows(
+            ui,
+            row_height,
+            self.saved.len(),
+            |ui, rows| {
+                for index in rows {
+                    let item = &self.saved[index];
+                    ui.push_id(&item.id, |ui| {
+                        ui.allocate_ui_with_layout(
+                            vec2(ui.available_width(), row_height),
+                            Layout::right_to_left(Align::Center),
+                            |ui| {
+                                ui.add_space(12.0);
+                                if ui
+                                    .add_enabled(can_discard, egui::Button::new("Discard…"))
+                                    .clicked()
+                                {
+                                    self.confirm_discard = Some(item.id.clone());
+                                }
+                                ui.with_layout(Layout::left_to_right(Align::Center), |ui| {
+                                    let short_id = item.id.get(..8).unwrap_or(&item.id);
+                                    ui.strong(format!("Transfer {short_id}"))
+                                        .on_hover_text(&item.id);
+                                    ui.weak(format!("{} saved", size(item.bytes)));
+                                });
+                            },
+                        );
                     });
                 }
-            });
-        }
+            },
+        );
+        let mut discard = None;
+        ui.horizontal_wrapped(|ui| {
+            if let Some(id) = &self.confirm_discard {
+                let short_id = id.get(..8).unwrap_or(id);
+                ui.label(format!("Discard {short_id}?"));
+                let keep = ui.button("Keep").clicked();
+                if ui
+                    .add_enabled(can_discard, egui::Button::new("Discard progress"))
+                    .clicked()
+                {
+                    discard = Some(id.clone());
+                }
+                if keep {
+                    self.confirm_discard = None;
+                }
+            } else if ui
+                .add_enabled(
+                    !self.loading_pending && !self.discarding,
+                    egui::Button::new("Refresh"),
+                )
+                .clicked()
+            {
+                self.refresh_pending(ui.ctx());
+            }
+        });
         if let Some(id) = discard {
             self.confirm_discard = None;
             self.discard(ui.ctx(), id);
         }
-        if ui
-            .add_enabled(
-                !self.loading_pending && !self.discarding,
-                egui::Button::new("Refresh"),
-            )
-            .clicked()
-        {
-            self.refresh_pending(ui.ctx());
-        }
     }
+}
+
+fn detail_scroll(id: impl std::hash::Hash, height: f32) -> egui::ScrollArea {
+    egui::ScrollArea::vertical()
+        .id_salt(id)
+        .max_height(height)
+        .auto_shrink([false, false])
+}
+
+fn diagnostic_lines(ui: &mut Ui, scroll: egui::ScrollArea, lines: &[String]) {
+    let row_height = ui.text_style_height(&TextStyle::Body);
+    scroll.show_rows(ui, row_height, lines.len(), |ui, rows| {
+        for line in &lines[rows] {
+            detail_line(ui, line);
+        }
+    });
+}
+
+fn detail_line(ui: &mut Ui, line: &str) {
+    ui.add(egui::Label::new(line).truncate().selectable(true))
+        .on_hover_text(line);
 }
 
 fn rgb(r: u8, g: u8, b: u8) -> Color32 {
@@ -993,7 +1141,13 @@ fn transfer_progress(ui: &mut Ui, progress: &Progress) {
     } else {
         u128::from(progress.done) * 100 / u128::from(progress.total)
     };
-    let rate = progress.rate(Instant::now());
+    let now = Instant::now();
+    let rate = progress.rate(now);
+    if rate.is_some() {
+        ui.ctx().request_repaint_after(
+            RATE_STALE_AFTER.saturating_sub(now.duration_since(progress.sampled_at)),
+        );
+    }
     let time = if remaining == 0 {
         "Finishing transfer…".into()
     } else if let Some(rate) = rate {
@@ -1003,10 +1157,13 @@ fn transfer_progress(ui: &mut Ui, progress: &Progress) {
         "Estimating time remaining…".into()
     };
     ui.strong(format!("{percent}% · {time}"));
+    let painted_fraction =
+        ui.ctx()
+            .animate_value_with_time(ui.id().with(progress.started), fraction, 0.12);
     ui.scope(|ui| {
         ui.visuals_mut().extreme_bg_color = ui.visuals().faint_bg_color;
         ui.add(
-            egui::ProgressBar::new(fraction)
+            egui::ProgressBar::new(painted_fraction)
                 .desired_height(12.0)
                 .fill(BLUE),
         );

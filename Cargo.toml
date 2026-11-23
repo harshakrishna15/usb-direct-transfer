@@ -14,7 +14,7 @@ path = "src/bin/usb-transfer-gui.rs"
 required-features = ["gui"]
 
 [features]
-gui = ["dep:eframe", "dep:rfd"]
+gui = ["dep:eframe", "dep:indexmap", "dep:rfd"]
 
 [dependencies]
 anyhow = "1"
@@ -22,6 +22,7 @@ clap = { version = "4", features = ["derive"] }
 eframe = { version = "0.33", default-features = false, features = ["accesskit", "default_fonts", "glow", "persistence", "wayland", "x11"], optional = true }
 filetime = "0.2"
 fs2 = "0.4"
+indexmap = { version = "2", optional = true }
 libc = "0.2"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "crypto"] }
 rfd = { version = "0.15", optional = true }

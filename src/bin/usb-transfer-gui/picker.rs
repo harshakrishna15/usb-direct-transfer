@@ -1,5 +1,6 @@
 use super::view::{heading, item_count, primary_button, quiet_button};
 use eframe::egui::{self, Align, Layout, Modal, Ui, vec2};
+use indexmap::IndexSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -52,7 +53,7 @@ pub(super) struct FilePicker {
     directory: PathBuf,
     location: String,
     entries: Vec<Entry>,
-    selected: Vec<PathBuf>,
+    selected: IndexSet<PathBuf>,
     reading: Option<Receiver<io::Result<Directory>>>,
     error: Option<String>,
 }
@@ -68,7 +69,7 @@ impl FilePicker {
             directory: PathBuf::new(),
             location: String::new(),
             entries: Vec::new(),
-            selected: Vec::new(),
+            selected: IndexSet::new(),
             reading: None,
             error: None,
         };
@@ -83,12 +84,13 @@ impl FilePicker {
     fn open(&mut self, ctx: &egui::Context, path: PathBuf) {
         self.location = path.to_string_lossy().into_owned();
         self.directory = path.clone();
-        self.entries.clear();
+        let previous_entries = std::mem::take(&mut self.entries);
         self.error = None;
         let (tx, rx) = mpsc::channel();
         self.reading = Some(rx);
         let ctx = ctx.clone();
         thread::spawn(move || {
+            drop(previous_entries);
             if tx.send(Directory::read(&path)).is_ok() {
                 ctx.request_repaint();
             }
@@ -126,7 +128,14 @@ impl FilePicker {
                 heading(ui, "Add files and folders");
                 self.navigation_ui(ui);
                 ui.separator();
-                self.entries_ui(ui, list_height);
+                ui.allocate_ui_with_layout(
+                    vec2(width, list_height),
+                    Layout::top_down(Align::Min),
+                    |ui| {
+                        ui.set_min_height(list_height);
+                        self.entries_ui(ui, list_height);
+                    },
+                );
                 ui.separator();
                 ui.horizontal(|ui| {
                     ui.weak(format!("{} selected", item_count(self.selected.len())));
@@ -143,7 +152,7 @@ impl FilePicker {
                 .inner
             });
         if modal.inner {
-            Some(std::mem::take(&mut self.selected))
+            Some(std::mem::take(&mut self.selected).into_iter().collect())
         } else if modal.should_close() {
             Some(Vec::new())
         } else {
@@ -158,15 +167,10 @@ impl FilePicker {
             .filter(|path| !path.as_os_str().is_empty());
         let next = ui
             .horizontal(|ui| {
-                if ui
+                let up = ui
                     .add_enabled(parent.is_some(), egui::Button::new("Up"))
-                    .clicked()
-                {
-                    return parent.map(Path::to_path_buf);
-                }
-                if ui.button("Home").clicked() {
-                    return Some(self.home.clone());
-                }
+                    .clicked();
+                let home = ui.button("Home").clicked();
                 let field = ui.add_sized(
                     [ui.available_width() - 52.0, ui.spacing().interact_size.y],
                     egui::TextEdit::singleline(&mut self.location).hint_text("Folder path"),
@@ -174,7 +178,11 @@ impl FilePicker {
                 let go = ui.button("Go").clicked()
                     || (field.lost_focus()
                         && ui.input(|input| input.key_pressed(egui::Key::Enter)));
-                if go && !self.location.trim().is_empty() {
+                if up {
+                    parent.map(Path::to_path_buf)
+                } else if home {
+                    Some(self.home.clone())
+                } else if go && !self.location.trim().is_empty() {
                     Some(self.directory.join(&self.location))
                 } else {
                     None
@@ -223,13 +231,15 @@ impl FilePicker {
                                     let mut selected = self.selected.contains(&entry.path);
                                     if ui
                                         .checkbox(&mut selected, &entry.name)
-                                        .on_hover_text(entry.path.display().to_string())
+                                        .on_hover_ui(|ui| {
+                                            ui.label(entry.path.display().to_string());
+                                        })
                                         .changed()
                                     {
                                         if selected {
-                                            self.selected.push(entry.path.clone());
+                                            self.selected.insert(entry.path.clone());
                                         } else {
-                                            self.selected.retain(|path| path != &entry.path);
+                                            self.selected.shift_remove(&entry.path);
                                         }
                                     }
                                 });

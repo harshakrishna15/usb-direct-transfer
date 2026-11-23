@@ -108,8 +108,21 @@ impl Drop for Session {
 }
 
 pub fn start(options: network::Options, destination: PathBuf) -> Session {
+    start_with_notify(options, destination, || {})
+}
+
+/// Calls `notify` on the worker thread after each event is queued.
+pub fn start_with_notify(
+    options: network::Options,
+    destination: PathBuf,
+    notify: impl Fn() + Send + 'static,
+) -> Session {
     let (commands, requests) = mpsc::channel();
-    let (updates, events) = mpsc::channel();
+    let (send, events) = mpsc::channel();
+    let updates = Updates {
+        send,
+        notify: Box::new(notify),
+    };
     let control = Arc::new(ConnectionControl::default());
     let worker_control = Arc::clone(&control);
     thread::spawn(move || {
@@ -137,8 +150,15 @@ pub fn start(options: network::Options, destination: PathBuf) -> Session {
     }
 }
 
-fn emit(updates: &mpsc::Sender<Event>, event: Event) {
-    let _ = updates.send(event);
+struct Updates {
+    send: mpsc::Sender<Event>,
+    notify: Box<dyn Fn() + Send>,
+}
+
+fn emit(updates: &Updates, event: Event) {
+    if updates.send.send(event).is_ok() {
+        (updates.notify)();
+    }
 }
 
 #[derive(Debug)]
@@ -265,7 +285,7 @@ fn pairing_code(material: [u8; 10]) -> String {
 fn confirm(
     stream: &mut impl Io,
     requests: &mpsc::Receiver<Command>,
-    updates: &mpsc::Sender<Event>,
+    updates: &Updates,
 ) -> Result<bool> {
     let deadline = Instant::now() + APPROVAL_TIMEOUT;
     let mut local = 0;
@@ -335,7 +355,7 @@ fn read_frame(stream: &mut impl Read) -> Result<Frame> {
     Ok(serde_json::from_slice(&payload).context("Invalid transfer frame")?)
 }
 
-fn progress(updates: &mpsc::Sender<Event>, receiving: bool) -> impl FnMut(u64, u64) + '_ {
+fn progress(updates: &Updates, receiving: bool) -> impl FnMut(u64, u64) + '_ {
     let mut last = None;
     move |done, total| {
         let now = Instant::now();
@@ -354,7 +374,7 @@ fn progress(updates: &mpsc::Sender<Event>, receiving: bool) -> impl FnMut(u64, u
     }
 }
 
-fn outgoing(stream: &mut impl Io, batch: Prepared, updates: &mpsc::Sender<Event>) -> Result<()> {
+fn outgoing(stream: &mut impl Io, batch: Prepared, updates: &Updates) -> Result<()> {
     write_frame(stream, Frame::Offer(batch.manifest.clone()))?;
     loop {
         match read_frame(stream)? {
@@ -391,7 +411,7 @@ fn incoming(
     manifest: Manifest,
     destination: &Path,
     requests: &mpsc::Receiver<Command>,
-    updates: &mpsc::Sender<Event>,
+    updates: &Updates,
     preparation: &mut Preparation,
 ) -> Result<bool> {
     let (names, bytes) = transfer::describe(&manifest)?;
@@ -465,7 +485,7 @@ struct Preparation {
 }
 
 impl Preparation {
-    fn queue(&mut self, paths: Vec<PathBuf>, updates: &mpsc::Sender<Event>) {
+    fn queue(&mut self, paths: Vec<PathBuf>, updates: &Updates) {
         if self.pending.is_some() {
             emit(
                 updates,
@@ -506,7 +526,7 @@ fn run(
     client: bool,
     destination: &Path,
     requests: &mpsc::Receiver<Command>,
-    updates: &mpsc::Sender<Event>,
+    updates: &Updates,
 ) -> Result<()> {
     let (mut stream, code) = secure(tcp, client)?;
     emit(updates, Event::PairCode(code));
@@ -564,6 +584,20 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::mpsc::{Receiver, Sender};
 
+    #[test]
+    fn queues_session_events_before_waking_the_ui() {
+        let (send, events) = mpsc::channel();
+        let (notified, observed) = mpsc::channel();
+        let updates = Updates {
+            send,
+            notify: Box::new(move || {
+                notified.send(events.try_recv().unwrap()).unwrap();
+            }),
+        };
+        emit(&updates, Event::Paired);
+        assert!(matches!(observed.try_recv(), Ok(Event::Paired)));
+    }
+
     struct Endpoint {
         commands: Sender<Command>,
         events: Receiver<Event>,
@@ -602,7 +636,11 @@ mod tests {
 
     fn endpoint(socket: TcpStream, client: bool, to: PathBuf) -> Endpoint {
         let (commands, requests) = mpsc::channel();
-        let (updates, events) = mpsc::channel();
+        let (send, events) = mpsc::channel();
+        let updates = Updates {
+            send,
+            notify: Box::new(|| {}),
+        };
         let worker_socket = socket.try_clone().unwrap();
         thread::spawn(move || {
             if let Err(error) = run(worker_socket, client, &to, &requests, &updates) {

@@ -8,14 +8,15 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::task::{Context, Poll, Waker};
+use std::task::{Context, Poll, Wake, Waker};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use indexmap::IndexSet;
 use usb_direct_transfer::{
     Command, ConnectionMonitor, ConnectionReport, Event, Options, Pending, Session, Summary,
-    discard, pending, probe_peer, start,
+    discard, pending, probe_peer, start_with_notify,
 };
 
 #[path = "usb-transfer-gui/picker.rs"]
@@ -27,6 +28,7 @@ use picker::FilePicker;
 
 const TITLE: &str = "USB Direct Transfer";
 const DESTINATION_KEY: &str = "destination";
+const RATE_STALE_AFTER: Duration = Duration::from_secs(3);
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -46,6 +48,18 @@ fn main() -> eframe::Result {
 
 type SaveDialog = Pin<Box<dyn Future<Output = Option<PathBuf>>>>;
 
+struct Repaint(egui::Context);
+
+impl Wake for Repaint {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.request_repaint();
+    }
+}
+
 enum Background {
     PeerCheck(Result<(), String>),
     Pending(PathBuf, Result<Vec<Pending>, String>),
@@ -53,7 +67,7 @@ enum Background {
 }
 
 struct LiveConnection {
-    updates: Receiver<ConnectionReport>,
+    updates: Receiver<Arc<ConnectionReport>>,
     stop: Arc<AtomicBool>,
 }
 
@@ -65,10 +79,19 @@ impl LiveConnection {
         let ctx = ctx.clone();
         thread::spawn(move || {
             let mut monitor = ConnectionMonitor::default();
+            let mut last_report = None;
             while !cancelled.load(Ordering::Relaxed) {
-                match tx.try_send(monitor.poll()) {
-                    Err(mpsc::TrySendError::Disconnected(_)) => break,
-                    _ => ctx.request_repaint(),
+                let report = monitor.poll();
+                if last_report.as_deref() != Some(&report) {
+                    let report = Arc::new(report);
+                    match tx.try_send(Arc::clone(&report)) {
+                        Ok(()) => {
+                            last_report = Some(report);
+                            ctx.request_repaint();
+                        }
+                        Err(mpsc::TrySendError::Full(_)) => {}
+                        Err(mpsc::TrySendError::Disconnected(_)) => break,
+                    }
                 }
                 for _ in 0..10 {
                     if cancelled.load(Ordering::Relaxed) {
@@ -108,8 +131,8 @@ impl Progress {
         let transferred = self.done.saturating_sub(self.initial);
         (elapsed >= 0.3
             && transferred > 0
-            && now.duration_since(self.sampled_at) <= Duration::from_secs(3))
-        .then(|| transferred as f64 / elapsed)
+            && now.duration_since(self.sampled_at) < RATE_STALE_AFTER)
+            .then(|| transferred as f64 / elapsed)
     }
 }
 
@@ -143,7 +166,7 @@ struct Desktop {
     session_detail: Option<String>,
     error: Option<String>,
     destination: Option<PathBuf>,
-    queued: Vec<PathBuf>,
+    queued: IndexSet<PathBuf>,
     last_sent: Vec<PathBuf>,
     incoming: Option<Incoming>,
     sending: bool,
@@ -156,13 +179,16 @@ struct Desktop {
     discarding: bool,
     peer_check: Option<Result<(), String>>,
     checking_peer: bool,
-    connection: Option<ConnectionReport>,
+    connection: Option<Arc<ConnectionReport>>,
     connection_watch: LiveConnection,
+    detail: Option<view::Detail>,
+    diagnostics_tab: view::DiagnosticsTab,
     save_dialog: Option<SaveDialog>,
     picker: Option<FilePicker>,
     picker_location: Option<PathBuf>,
     background_tx: Sender<Background>,
     background_rx: Receiver<Background>,
+    repaint: Waker,
 }
 
 impl Desktop {
@@ -182,7 +208,7 @@ impl Desktop {
                 .and_then(|storage| storage.get_string(DESTINATION_KEY))
                 .filter(|path| !path.is_empty())
                 .map(PathBuf::from),
-            queued: Vec::new(),
+            queued: IndexSet::new(),
             last_sent: Vec::new(),
             incoming: None,
             sending: false,
@@ -197,11 +223,14 @@ impl Desktop {
             checking_peer: false,
             connection: None,
             connection_watch: LiveConnection::new(&context.egui_ctx),
+            detail: None,
+            diagnostics_tab: view::DiagnosticsTab::Overview,
             save_dialog: None,
             picker: None,
             picker_location: None,
             background_tx,
             background_rx,
+            repaint: Waker::from(Arc::new(Repaint(context.egui_ctx.clone()))),
         };
         app.refresh_pending(&context.egui_ctx);
         app
@@ -236,6 +265,7 @@ impl Desktop {
         let Some(destination) = self.destination.clone() else {
             return;
         };
+        self.confirm_discard = None;
         self.loading_pending = true;
         self.background(ctx, move || {
             let result = pending(&destination).map_err(|error| format!("{error:#}"));
@@ -304,7 +334,7 @@ impl Desktop {
         let Some(dialog) = &mut self.save_dialog else {
             return;
         };
-        let mut context = Context::from_waker(Waker::noop());
+        let mut context = Context::from_waker(&self.repaint);
         if let Poll::Ready(path) = dialog.as_mut().poll(&mut context) {
             if let Some(path) = path {
                 self.destination = Some(path);
@@ -321,11 +351,7 @@ impl Desktop {
     }
 
     fn add_paths(&mut self, paths: Vec<PathBuf>) {
-        for path in paths {
-            if !self.queued.contains(&path) {
-                self.queued.push(path);
-            }
-        }
+        self.queued.extend(paths);
     }
 
     fn send_command(&mut self, command: Command) -> bool {
@@ -340,9 +366,11 @@ impl Desktop {
     }
 
     fn begin(&mut self) {
-        self.session = Some(start(
+        let repaint = self.repaint.clone();
+        self.session = Some(start_with_notify(
             self.options(),
             self.destination.clone().unwrap_or_default(),
+            move || repaint.wake_by_ref(),
         ));
         self.error = None;
         self.session_detail = None;
@@ -419,16 +447,17 @@ impl Desktop {
             };
             let event = match session.events.try_recv() {
                 Ok(event) => event,
-                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Empty) => return,
                 Err(mpsc::TryRecvError::Disconnected) => {
                     self.disconnect(ctx);
-                    break;
+                    return;
                 }
             };
             match event {
                 Event::Status(status) => self.session_detail = Some(status),
                 Event::PairCode(code) if !matches!(self.pairing, Pairing::Disconnecting) => {
                     self.pairing = Pairing::Compare(code);
+                    self.detail = None;
                     if self.page == Page::Settings {
                         self.page = Page::Receive;
                     }
@@ -441,6 +470,7 @@ impl Desktop {
                 }
                 Event::Incoming { names, bytes } => {
                     self.incoming = Some(Incoming { names, bytes });
+                    self.detail = None;
                     self.page = Page::Receive;
                 }
                 Event::IncomingClosed { accepted } => {
@@ -493,6 +523,7 @@ impl Desktop {
                 Event::Disconnected => self.disconnect(ctx),
             }
         }
+        ctx.request_repaint();
     }
 }
 
@@ -501,9 +532,6 @@ impl eframe::App for Desktop {
         self.update_background(ctx);
         self.update_session(ctx);
         self.update_save_dialog(ctx);
-        if self.session.is_some() || self.save_dialog.is_some() {
-            ctx.request_repaint_after(Duration::from_millis(60));
-        }
         let dropped: Vec<_> = ctx.input(|input| {
             input
                 .raw

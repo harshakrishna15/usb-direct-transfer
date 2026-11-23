@@ -5,5 +5,5 @@ mod transfer;
 
 pub use diagnostics::{CheckState, ConnectionCheck, ConnectionMonitor, ConnectionReport};
 pub use network::{Interface, Options, benchmark, doctor, interfaces, probe_peer};
-pub use session::{Command, Event, Session, start};
+pub use session::{Command, Event, Session, start, start_with_notify};
 pub use transfer::{Pending, Summary, discard, pending};
