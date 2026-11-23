@@ -1,2 +1,23 @@
+# Cargo, desktop bundles, and platform binaries
 /target/
+*.app/
+*.dSYM/
+*.exe
+*.pdb
+
+# Linux kernel module build artifacts
+*.ko
+*.ko.*
+*.o
+cdc_ncm.mod
+*.mod.c
+.*.cmd
+Module.symvers
+modules.order
+.tmp_versions/
+
+# Files created by macOS and Windows Explorer
 .DS_Store
+._*
+Thumbs.db
+[Dd]esktop.ini
