@@ -30,7 +30,7 @@ jobs:
         run: |
           cargo +stable build --locked --release --features gui --bin usb-transfer-gui
           ./scripts/package-macos.sh
-          xcrun lipo -verify_arch arm64 "target/release/USB Direct Transfer.app/Contents/MacOS/usb-transfer-gui"
+          xcrun lipo "target/release/USB Direct Transfer.app/Contents/MacOS/usb-transfer-gui" -verify_arch arm64
           ditto -c -k --sequesterRsrc --keepParent "target/release/USB Direct Transfer.app" \
             "target/release/USB-Direct-Transfer-macOS-arm64.zip"
       - name: Upload Mac app
