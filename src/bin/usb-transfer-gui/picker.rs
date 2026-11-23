@@ -1,5 +1,5 @@
 use super::view::{chevron, dialog_backdrop, heading, item_count, primary_button, quiet_button};
-use eframe::egui::{self, Align, Layout, Modal, Ui, vec2};
+use eframe::egui::{self, Align, Color32, Layout, Modal, Stroke, Ui, vec2};
 use indexmap::IndexSet;
 use std::fs;
 use std::io;
@@ -275,8 +275,15 @@ impl FilePicker {
                             Layout::left_to_right(Align::Center),
                             |ui| {
                                 let was_selected = self.selected.contains(&entry.path);
-                                let mut selected = was_selected;
-                                let checkbox = ui.checkbox(&mut selected, "");
+                                let mut checkbox = ui.allocate_response(
+                                    vec2(row_height, row_height),
+                                    egui::Sense::click(),
+                                );
+                                let clicked = checkbox.clicked();
+                                if clicked {
+                                    checkbox.request_focus();
+                                }
+                                let mut selected = was_selected ^ clicked;
                                 let arrow = ui.id().with("browse-folder");
                                 let name = egui::Button::new(&entry.name)
                                     .frame_when_inactive(false)
@@ -284,7 +291,6 @@ impl FilePicker {
                                     .right_text(egui::Atom::custom(arrow, vec2(14.0, 14.0)))
                                     .min_size(vec2(ui.available_width(), row_height))
                                     .atom_ui(ui);
-                                checkbox.labelled_by(name.response.id);
                                 if entry.folder
                                     && let Some(rect) = name.rect(arrow)
                                 {
@@ -304,12 +310,14 @@ impl FilePicker {
                                     }
                                 }
                                 if selected != was_selected {
+                                    checkbox.mark_changed();
                                     if selected {
                                         self.selected.insert(entry.path.clone());
                                     } else {
                                         self.selected.shift_remove(&entry.path);
                                     }
                                 }
+                                draw_checkbox(ui, &checkbox, &entry.name, selected);
                             },
                         );
                     });
@@ -318,5 +326,58 @@ impl FilePicker {
         if let Some(path) = next {
             self.open(ui.ctx(), path);
         }
+    }
+}
+
+fn draw_checkbox(ui: &Ui, response: &egui::Response, name: &str, selected: bool) {
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Checkbox, ui.is_enabled(), selected, name)
+    });
+    if !ui.is_rect_visible(response.rect) {
+        return;
+    }
+
+    let visuals = ui.visuals();
+    let accent = visuals.selection.bg_fill;
+    let fill = if selected {
+        accent
+    } else if response.hovered() {
+        visuals.faint_bg_color
+    } else {
+        Color32::TRANSPARENT
+    };
+    let outline = if selected {
+        accent
+    } else if response.hovered() || response.has_focus() {
+        visuals.hyperlink_color
+    } else {
+        visuals.weak_text_color().gamma_multiply(0.72)
+    };
+    let center = response.rect.center();
+    let square = egui::Rect::from_center_size(center, vec2(18.0, 18.0));
+    ui.painter().rect(
+        square,
+        4,
+        fill,
+        Stroke::new(1.0_f32, outline),
+        egui::StrokeKind::Inside,
+    );
+    if selected {
+        ui.painter().add(egui::Shape::line(
+            vec![
+                center + vec2(-4.5, 0.0),
+                center + vec2(-1.2, 3.3),
+                center + vec2(4.5, -3.3),
+            ],
+            Stroke::new(2.0_f32, Color32::WHITE),
+        ));
+    }
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            square.expand(3.0),
+            6,
+            Stroke::new(1.0_f32, visuals.hyperlink_color),
+            egui::StrokeKind::Inside,
+        );
     }
 }

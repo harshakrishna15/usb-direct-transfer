@@ -165,13 +165,24 @@ impl Desktop {
         let panel =
             Frame::central_panel(&ctx.style()).inner_margin(egui::Margin::symmetric(margin, 12));
         egui::CentralPanel::default().frame(panel).show(ctx, |ui| {
+            let body_height = ui.available_height();
+            let idle_height = if self.error.is_none()
+                && self.result.is_none()
+                && !self.sending
+                && !self.receiving
+                && self.last_sent.is_empty()
+            {
+                body_height
+            } else {
+                0.0
+            };
             egui::ScrollArea::vertical()
                 .id_salt((self.page, comparing, self.incoming.is_some()))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     column(ui, |ui| {
                         if comparing {
-                            self.pairing_code_ui(ui);
+                            self.pairing_code_ui(ui, body_height);
                             return;
                         }
                         self.error_ui(ui);
@@ -180,8 +191,8 @@ impl Desktop {
                         }
                         match self.page {
                             Page::Receive if self.incoming.is_some() => self.incoming_ui(ui, frame),
-                            Page::Receive => self.receive_ui(ui, frame, cable_ready),
-                            Page::Send => self.send_ui(ui),
+                            Page::Receive => self.receive_ui(ui, frame, cable_ready, idle_height),
+                            Page::Send => self.send_ui(ui, idle_height),
                             Page::Settings => self.settings_ui(ui, frame),
                         }
                     })
@@ -240,35 +251,46 @@ impl Desktop {
         }
     }
 
-    fn pairing_code_ui(&mut self, ui: &mut Ui) {
+    fn pairing_code_ui(&mut self, ui: &mut Ui, height: f32) {
         let Pairing::Compare(code) = &self.pairing else {
             return;
         };
         let (matched, differs) = ui
             .vertical_centered(|ui| {
-                ui.add_space(30.0);
+                let caption = centered_caption(
+                    ui,
+                    "Confirm on both computers if the codes are identical.",
+                    ui.visuals().text_color(),
+                );
+                ui.add_space(centered_padding(
+                    height,
+                    154.0 + caption.size().y - ui.text_style_height(&TextStyle::Body),
+                ));
                 heading(ui, "Compare the pairing code");
-                ui.label("Confirm on both computers if the codes are identical.");
+                ui.label(caption);
                 ui.add_space(12.0);
                 ui.add(
                     egui::Label::new(RichText::new(code).monospace().size(24.0)).selectable(true),
                 );
                 ui.add_space(12.0);
-                ui.columns_const(|[confirm, decline]| {
-                    (
-                        confirm
-                            .with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                primary_button(ui, "Codes match", true).clicked()
-                            })
-                            .inner,
-                        decline
-                            .with_layout(Layout::left_to_right(Align::Center), |ui| {
-                                ui.add(egui::Button::new("Codes differ").min_size(vec2(0.0, 36.0)))
-                                    .clicked()
-                            })
-                            .inner,
-                    )
-                })
+                let button_width = 122.0;
+                let row_width = 2.0 * button_width + ui.spacing().item_spacing.x;
+                ui.allocate_ui_with_layout(
+                    vec2(row_width, 36.0),
+                    Layout::left_to_right(Align::Center),
+                    |ui| {
+                        (
+                            primary_button_with_width(ui, "Codes match", true, button_width)
+                                .clicked(),
+                            ui.add(
+                                egui::Button::new("Codes differ")
+                                    .min_size(vec2(button_width, 36.0)),
+                            )
+                            .clicked(),
+                        )
+                    },
+                )
+                .inner
             })
             .inner;
         if matched || differs {
@@ -333,7 +355,7 @@ impl Desktop {
         }
     }
 
-    fn send_ui(&mut self, ui: &mut Ui) {
+    fn send_ui(&mut self, ui: &mut Ui, idle_height: f32) {
         let paired = matches!(self.pairing, Pairing::Paired);
         let ready = paired && !self.sending && !self.receiving && self.incoming.is_none();
         let can_choose = self.save_dialog.is_none() && self.picker.is_none();
@@ -348,8 +370,9 @@ impl Desktop {
                 .fill(highlight)
                 .corner_radius(12)
                 .show(ui, |ui| {
+                    ui.set_min_height(idle_height);
                     ui.vertical_centered(|ui| {
-                        ui.add_space(30.0);
+                        ui.add_space(centered_padding(idle_height, 152.0));
                         transfer_icon(ui, Page::Send);
                         ui.add_space(8.0);
                         heading(
@@ -452,28 +475,52 @@ impl Desktop {
         }
     }
 
-    fn receive_ui(&mut self, ui: &mut Ui, frame: &eframe::Frame, cable_ready: bool) {
+    fn receive_ui(
+        &mut self,
+        ui: &mut Ui,
+        frame: &eframe::Frame,
+        cable_ready: bool,
+        idle_height: f32,
+    ) {
         if self.receiving {
             return;
         }
+        let (title, detail) = match self.pairing {
+            Pairing::Paired => (
+                "Ready to receive",
+                "Send files from the other computer. They’ll appear here for your approval.",
+            ),
+            Pairing::Searching(started) if started.elapsed() >= PAIRING_HINT_DELAY => (
+                "Pairing the computers",
+                "If both computers are waiting, check the firewall’s rules for this cable.",
+            ),
+            Pairing::Searching(_) => (
+                "Pairing the computers",
+                "Choose Pair on the other computer too.",
+            ),
+            Pairing::WaitingForConfirmation => (
+                "Pairing the computers",
+                "Confirm the matching code on the other computer.",
+            ),
+            _ if cable_ready => ("Pair to receive", "Choose Pair on both computers."),
+            _ => (
+                "Pair to receive",
+                "Connect a data cable, then choose Pair on both computers.",
+            ),
+        };
+        let message_height = (idle_height - 48.0).max(0.0);
         ui.vertical_centered(|ui| {
-                ui.add_space(30.0);
-                transfer_icon(ui, Page::Receive);
-                ui.add_space(7.0);
-                let (title, detail) = match self.pairing {
-                    Pairing::Paired => ("Ready to receive", "Send files from the other computer. They’ll appear here for your approval."),
-                    Pairing::Searching(started) if started.elapsed() >= PAIRING_HINT_DELAY => (
-                        "Pairing the computers",
-                        "If Pair is open on both computers, check the app’s access to the direct cable in your firewall settings.",
-                    ),
-                    Pairing::Searching(_) => ("Pairing the computers", "Choose Pair on the other computer too."),
-                    Pairing::WaitingForConfirmation => ("Pairing the computers", "Confirm the matching code on the other computer."),
-                    _ if cable_ready => ("Pair to receive", "Choose Pair on both computers."),
-                    _ => ("Pair to receive", "Connect both computers with a data cable and choose Pair on each one."),
-                };
-                heading(ui, title);
-                ui.weak(detail);
-                ui.add_space(24.0);
+            let caption = centered_caption(ui, detail, ui.visuals().weak_text_color());
+            ui.set_min_height(message_height);
+            ui.add_space(centered_padding(
+                message_height,
+                100.0 + caption.size().y - ui.text_style_height(&TextStyle::Body),
+            ));
+            transfer_icon(ui, Page::Receive);
+            ui.add_space(7.0);
+            heading(ui, title);
+            ui.label(caption);
+            ui.add_space(24.0);
         });
         self.save_folder_ui(ui, frame);
     }
@@ -1080,6 +1127,15 @@ pub(super) fn heading(ui: &mut Ui, title: &str) {
 }
 
 pub(super) fn primary_button(ui: &mut Ui, label: &str, enabled: bool) -> egui::Response {
+    primary_button_with_width(ui, label, enabled, 80.0)
+}
+
+fn primary_button_with_width(
+    ui: &mut Ui,
+    label: &str,
+    enabled: bool,
+    width: f32,
+) -> egui::Response {
     ui.scope(|ui| {
         if enabled {
             let focus = ui.visuals().hyperlink_color;
@@ -1097,12 +1153,27 @@ pub(super) fn primary_button(ui: &mut Ui, label: &str, enabled: bool) -> egui::R
         ui.with_layout(ui.layout().with_main_align(Align::Center), |ui| {
             ui.add_enabled(
                 enabled,
-                egui::Button::new(RichText::new(label).strong()).min_size(vec2(80.0, 36.0)),
+                egui::Button::new(RichText::new(label).strong()).min_size(vec2(width, 36.0)),
             )
         })
         .inner
     })
     .inner
+}
+
+fn centered_padding(available: f32, content: f32) -> f32 {
+    ((available - content) * 0.5).max(16.0)
+}
+
+fn centered_caption(ui: &Ui, text: &str, color: Color32) -> std::sync::Arc<egui::Galley> {
+    let mut job = egui::text::LayoutJob::simple(
+        text.to_owned(),
+        TextStyle::Body.resolve(ui.style()),
+        color,
+        ui.available_width(),
+    );
+    job.halign = Align::Center;
+    ui.fonts_mut(|fonts| fonts.layout_job(job))
 }
 
 pub(super) fn quiet_button(ui: &mut Ui, label: &str) -> egui::Response {
