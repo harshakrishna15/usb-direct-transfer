@@ -2,10 +2,12 @@ use super::{Desktop, Page, Pairing, Pick, display_name, nonempty, size};
 use eframe::egui::{
     self, Align, Color32, FontFamily, FontId, Frame, Layout, RichText, Stroke, TextStyle, Ui, vec2,
 };
+use std::time::Duration;
 use usb_direct_transfer::CheckState;
 
 const BLUE: Color32 = Color32::from_rgb(39, 85, 207);
 const CONTENT_WIDTH: f32 = 640.0;
+const PAIRING_HINT_DELAY: Duration = Duration::from_secs(8);
 
 impl Page {
     fn label(self) -> &'static str {
@@ -256,7 +258,10 @@ impl Desktop {
             Pairing::Idle if cable_ready => ("Cable connected", Some("Pair")),
             Pairing::Idle if self.connection.is_none() => ("Checking the cable…", Some("Pair")),
             Pairing::Idle => ("Connect a data cable", Some("Pair")),
-            Pairing::Searching => ("Looking for the other computer…", Some("Cancel")),
+            Pairing::Searching(started) if started.elapsed() >= PAIRING_HINT_DELAY => {
+                ("Still waiting for the other computer", Some("Cancel"))
+            }
+            Pairing::Searching(_) => ("Looking for the other computer…", Some("Cancel")),
             Pairing::WaitingForConfirmation => ("Confirm on the other computer", Some("Cancel")),
             Pairing::Paired => ("Paired over the cable", Some("Disconnect")),
             Pairing::Disconnecting => ("Disconnecting…", None),
@@ -429,7 +434,11 @@ impl Desktop {
                 ui.add_space(7.0);
                 let (title, detail) = match self.pairing {
                     Pairing::Paired => ("Ready to receive", "Send files from the other computer. They’ll appear here for your approval."),
-                    Pairing::Searching => ("Pairing the computers", "Choose Pair on the other computer too."),
+                    Pairing::Searching(started) if started.elapsed() >= PAIRING_HINT_DELAY => (
+                        "Pairing the computers",
+                        "If Pair is open on both computers, check the app’s access to the direct cable in your firewall settings.",
+                    ),
+                    Pairing::Searching(_) => ("Pairing the computers", "Choose Pair on the other computer too."),
                     Pairing::WaitingForConfirmation => ("Pairing the computers", "Confirm the matching code on the other computer."),
                     _ if cable_ready => ("Pair to receive", "Choose Pair on both computers."),
                     _ => ("Pair to receive", "Connect both computers with a data cable and choose Pair on each one."),

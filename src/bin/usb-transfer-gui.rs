@@ -113,7 +113,7 @@ enum Page {
 
 enum Pairing {
     Idle,
-    Searching,
+    Searching(Instant),
     Compare(String),
     WaitingForConfirmation,
     Paired,
@@ -341,7 +341,7 @@ impl Desktop {
         ));
         self.error = None;
         self.session_detail = None;
-        self.pairing = Pairing::Searching;
+        self.pairing = Pairing::Searching(Instant::now());
     }
 
     fn disconnect(&mut self, ctx: &egui::Context) {

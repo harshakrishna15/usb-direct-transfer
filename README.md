@@ -92,7 +92,7 @@ For manual pairing, open **Settings → Manual pairing**, select the cable inter
 
 If the cable adapters are up but lack addresses on a shared subnet, assign distinct unused private IPv4 addresses to the cable adapters, for example `192.168.77.1` and `192.168.77.2` with subnet mask `255.255.255.0`. Leave the gateway blank on those adapters and use the assigned peer addresses for manual pairing. Allow Local Network access on the Mac if prompted.
 
-Discovery uses link-local multicast on UDP 48394. Pairing and the diagnostics probe use TCP 48393. If the firewall blocks discovery or pairing, scope any exception to the app and the direct cable interface.
+Discovery uses link-local multicast on UDP 48394. Pairing and the diagnostics probe use TCP 48393. If discovery stalls on Linux, the app can try an outbound connection to a peer the system already knows on that cable. If a firewall exception is still needed, scope it to the app and the direct cable interface.
 
 ## Retry or discard
 

@@ -29,6 +29,8 @@ const PROBE: &[u8; 8] = b"UDT1PING";
 const ACCEPTED: &[u8; 8] = b"UDT1OKAY";
 const CONNECT_WAIT: Duration = Duration::from_millis(450);
 const PREFACE_WAIT: Duration = Duration::from_secs(2);
+#[cfg(target_os = "linux")]
+const DIRECT_RETRY_DELAY: Duration = Duration::from_secs(2);
 type NodeId = [u8; 16];
 
 #[derive(Clone, Copy)]
@@ -608,6 +610,8 @@ fn connect_mode(
     ));
     let mut next_advertisement = Instant::now();
     let mut discovery_error_reported = false;
+    #[cfg(target_os = "linux")]
+    let mut next_direct_attempt = Instant::now() + DIRECT_RETRY_DELAY;
     while !cancel.load(Ordering::Relaxed) {
         let now = Instant::now();
         for endpoint in &mut endpoints {
@@ -640,10 +644,15 @@ fn connect_mode(
                 match discovery.listen.recv_from(&mut packet) {
                     Ok((24, from))
                         if &packet[..8] == mode.discovery()
-                            && packet[8..24] > id[..]
-                            && endpoint.address.directly_reaches(from.ip())
-                            && now >= endpoint.next_attempt =>
+                            && endpoint.address.directly_reaches(from.ip()) =>
                     {
+                        #[cfg(target_os = "linux")]
+                        {
+                            next_direct_attempt = now + DIRECT_RETRY_DELAY;
+                        }
+                        if packet[8..24] <= id[..] || now < endpoint.next_attempt {
+                            continue;
+                        }
                         endpoint.next_attempt = now + Duration::from_millis(200);
                         let mut handshake = [0; 32];
                         handshake[..16].copy_from_slice(&id);
@@ -662,6 +671,25 @@ fn connect_mode(
         }
         if now >= next_advertisement {
             next_advertisement = now + Duration::from_millis(625);
+        }
+        #[cfg(target_os = "linux")]
+        if matches!(mode, Mode::Pair)
+            && manual.is_none()
+            && now >= next_direct_attempt
+            && !cancel.load(Ordering::Relaxed)
+        {
+            next_direct_attempt = now + DIRECT_RETRY_DELAY;
+            // An outbound connection can work when the firewall drops incoming
+            // multicast. Use only a peer already known on this cable.
+            for (address, peer) in linux_direct_peers(&name, &endpoints) {
+                if cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                if let Ok(stream) = establish(address, peer, mode.manual(), &[]) {
+                    status(format!("Connected directly to the cable peer on {name}."));
+                    return Ok((stream, true));
+                }
+            }
         }
         thread::sleep(Duration::from_millis(35));
     }
@@ -1189,14 +1217,19 @@ fn scan() -> Result<Scan> {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_links(name: Option<&str>) -> Result<Vec<LinuxLink>> {
+fn linux_ip() -> Command {
     use std::path::Path;
 
     let executable = ["/usr/sbin/ip", "/usr/bin/ip", "/sbin/ip", "/bin/ip"]
         .into_iter()
         .find(|path| Path::new(path).is_file())
         .unwrap_or("ip");
-    let mut ip = Command::new(executable);
+    Command::new(executable)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_links(name: Option<&str>) -> Result<Vec<LinuxLink>> {
+    let mut ip = linux_ip();
     ip.args(["-j", "address", "show"]);
     if let Some(name) = name {
         ip.args(["dev", name]);
@@ -1204,6 +1237,61 @@ fn linux_links(name: Option<&str>) -> Result<Vec<LinuxLink>> {
     let output =
         command(ip, "ip address").context("Linux interface discovery requires iproute2")?;
     serde_json::from_str(&output).context("Could not read Linux address information")
+}
+
+#[cfg(target_os = "linux")]
+fn linux_direct_peers(name: &str, endpoints: &[Endpoint]) -> Vec<(Address, IpAddr)> {
+    let mut ip = linux_ip();
+    ip.args(["-j", "neigh", "show", "dev", name]);
+    let Ok(output) = command(ip, "ip neigh") else {
+        return Vec::new();
+    };
+    direct_peers(&output, endpoints.iter().map(|endpoint| endpoint.address))
+}
+
+#[cfg(target_os = "linux")]
+fn direct_peers(output: &str, addresses: impl Iterator<Item = Address>) -> Vec<(Address, IpAddr)> {
+    #[derive(serde::Deserialize)]
+    struct Neighbor {
+        dst: IpAddr,
+        lladdr: Option<String>,
+        #[serde(default)]
+        state: Vec<String>,
+    }
+    let Ok(neighbors) = serde_json::from_str::<Vec<Neighbor>>(output) else {
+        return Vec::new();
+    };
+    let mut peer_mac = None;
+    let mut peers = Vec::new();
+    for address in addresses {
+        let mut peer = None;
+        for neighbor in &neighbors {
+            let Some(mac) = neighbor.lladdr.as_deref() else {
+                continue;
+            };
+            if !address.directly_reaches(neighbor.dst)
+                || !neighbor.state.iter().any(|state| {
+                    matches!(
+                        state.as_str(),
+                        "REACHABLE" | "STALE" | "DELAY" | "PROBE" | "PERMANENT"
+                    )
+                })
+            {
+                continue;
+            }
+            if *peer_mac.get_or_insert(mac) != mac {
+                return Vec::new();
+            }
+            // The existing manual preface requires the lower address to dial.
+            if address.ip < neighbor.dst {
+                peer.get_or_insert(neighbor.dst);
+            }
+        }
+        if let Some(peer) = peer {
+            peers.push((address, peer));
+        }
+    }
+    peers
 }
 
 #[cfg(any(target_os = "linux", all(test, unix)))]
@@ -1465,6 +1553,37 @@ mod tests {
                 .iter()
                 .any(|entry| entry.contains("no supported cdc_ncm"))
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn direct_pairing_uses_a_single_known_peer_on_the_cable() {
+        let ipv4 = Address {
+            ip: "169.254.40.1".parse().unwrap(),
+            prefix: 16,
+            index: 7,
+        };
+        let ipv6 = Address {
+            ip: "fe80::3".parse().unwrap(),
+            prefix: 64,
+            index: 7,
+        };
+        let neighbors = r#"[
+            {"dst":"169.254.40.2","lladdr":"02:00:00:00:00:01","state":["STALE"]},
+            {"dst":"fe80::2","lladdr":"02:00:00:00:00:01","state":["REACHABLE"]},
+            {"dst":"169.254.40.3","state":["INCOMPLETE"]},
+            {"dst":"192.168.1.1","lladdr":"02:00:00:00:00:02","state":["REACHABLE"]}
+        ]"#;
+        assert_eq!(
+            direct_peers(neighbors, [ipv6, ipv4].into_iter()),
+            vec![(ipv4, "169.254.40.2".parse().unwrap())]
+        );
+
+        let ambiguous = r#"[
+            {"dst":"169.254.40.2","lladdr":"02:00:00:00:00:01","state":["REACHABLE"]},
+            {"dst":"fe80::2","lladdr":"02:00:00:00:00:02","state":["REACHABLE"]}
+        ]"#;
+        assert!(direct_peers(ambiguous, [ipv6, ipv4].into_iter()).is_empty());
     }
 
     #[cfg(target_os = "linux")]
