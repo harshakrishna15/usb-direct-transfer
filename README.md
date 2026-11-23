@@ -85,7 +85,7 @@ After rebooting, plug in the Mac and check `lsusb -t` and `usb-transfer doctor`.
 1. Connect both computers directly using the cable. Run `usb-transfer doctor` or open **Settings → Connection diagnostics** in the app if the cable status needs attention.
 2. Start `usb-transfer pair --to "/path/to/receive-folder"` on both machines, or open both apps and choose **Pair**. The CLI folder must already exist. In the app, choose the destination when reviewing an incoming batch.
 3. Compare the pairing code on both screens. Approve on both computers only if the codes match. Pair again after unplugging or restarting.
-4. On either side, choose the files or folders to send. In the CLI use `send PATH...` with double quotes around paths containing spaces. In the app, drop items into the window or open **Send** to use the file and folder pickers.
+4. On either side, choose the files or folders to send. In the CLI use `send PATH...` with double quotes around paths containing spaces. In the app, drop items into the window or use **Add items** on the **Send** screen.
 5. Review and approve the batch on the receiving side. The result lists renamed and skipped items. Existing items are preserved.
 
 For manual pairing, open **Settings → Manual pairing**, select the cable interface, and enter the other computer's cable IP on **both** sides. In the CLI, use `pair --interface NAME --peer ADDRESS --to DIR`. You can omit the suffix from an IPv6 link-local address because the app uses your local cable interface to scope it. `doctor --interface NAME --peer ADDRESS` can probe the link while the other computer is waiting to pair.

@@ -317,32 +317,7 @@ impl Desktop {
                 };
                 heading(ui, label);
                 ui.add_space(7.0);
-                ui.columns_const(|[files, folder]| {
-                    files.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let choose = if ready {
-                            primary_button(ui, "Choose files…", can_choose)
-                        } else {
-                            ui.add_enabled(
-                                can_choose,
-                                egui::Button::new("Choose files…").min_size(vec2(0.0, 36.0)),
-                            )
-                        };
-                        if choose.clicked() {
-                            self.open_dialog(Pick::Files, frame);
-                        }
-                    });
-                    folder.with_layout(Layout::left_to_right(Align::Center), |ui| {
-                        if ui
-                            .add_enabled(
-                                self.dialog.is_none(),
-                                egui::Button::new("Choose folder…").min_size(vec2(0.0, 36.0)),
-                            )
-                            .clicked()
-                        {
-                            self.open_dialog(Pick::Folder, frame);
-                        }
-                    });
-                });
+                self.add_items_menu(ui, frame, true);
             });
         } else {
             ui.add_space(8.0);
@@ -386,18 +361,7 @@ impl Desktop {
                 {
                     self.queued.clear();
                 }
-                if ui
-                    .add_enabled(can_choose, egui::Button::new("Add files…"))
-                    .clicked()
-                {
-                    self.open_dialog(Pick::Files, frame);
-                }
-                if ui
-                    .add_enabled(can_choose, egui::Button::new("Add folder…"))
-                    .clicked()
-                {
-                    self.open_dialog(Pick::Folder, frame);
-                }
+                self.add_items_menu(ui, frame, false);
             });
             if self.incoming.is_some() {
                 ui.weak("Review the incoming transfer in Receive.");
@@ -424,6 +388,24 @@ impl Desktop {
                 }
             });
         }
+    }
+
+    fn add_items_menu(&mut self, ui: &mut Ui, frame: &eframe::Frame, primary: bool) {
+        let enabled = self.dialog.is_none();
+        let label = "Add items…";
+        let button = if primary {
+            primary_button(ui, label, enabled)
+        } else {
+            ui.add_enabled(enabled, egui::Button::new(label))
+        };
+        egui::Popup::menu(&button).show(|ui| {
+            for (label, pick) in [("Files…", Pick::Files), ("Folder…", Pick::Folder)] {
+                if ui.button(label).clicked() {
+                    ui.close();
+                    self.open_dialog(pick, frame);
+                }
+            }
+        });
     }
 
     fn receive_ui(&mut self, ui: &mut Ui, frame: &eframe::Frame, cable_ready: bool) {
