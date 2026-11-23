@@ -2,18 +2,62 @@
 
 Send files and folders in either direction between two computers over a direct USB-C network link. The CLI and desktop app use the same encrypted protocol and can pair with each other.
 
-The first hardware target is an Apple silicon Mac and a Windows 11 x64 PC connected by an ordinary Apple USB-C charging cable. The cable and OS drivers must expose a working network interface on each computer. The app pins connections to recognized direct USB or Thunderbolt/USB4 interfaces and ends the session if the selected link disappears.
+The first hardware target is an Apple silicon Mac and a Linux PC connected by an ordinary Apple USB-C charging cable. Either computer can send or receive once the operating systems bring up the cable interfaces. The app pins connections to recognized direct USB or Thunderbolt/USB4 interfaces and ends the session if the selected link disappears. Windows charging-cable testing follows once the target PC has a qualified driver.
 
 ## Build
 
-Use a current stable Rust toolchain on macOS or Windows.
+Use a current stable Rust toolchain and a C compiler on each machine.
 
 ```sh
 cargo build --locked --release --bin usb-transfer
 cargo build --locked --release --features gui --bin usb-transfer-gui
 ```
 
-On macOS, run `./scripts/package-macos.sh` to create the desktop app bundle in `target/release`. On Windows, the two executables are in `target\release`. The app runs as a regular user. A separately qualified driver installation, if needed, is an OS setup step.
+On macOS, run `./scripts/package-macos.sh` to create the desktop app bundle in `target/release`. On Linux, run `./target/release/usb-transfer` or `./target/release/usb-transfer-gui`. The prebuilt Linux x64 test binaries require glibc 2.34 or newer. The Linux app uses `ip` from `iproute2`. The GUI uses OpenGL and the XDG Desktop Portal file chooser provided by your desktop session. Run the app as a regular user.
+
+## Check the Linux cable driver
+
+Plug the Mac directly into the Linux computer using the Apple cable. Keep the Mac awake and unlock it to respond to a USB accessory prompt if one appears. On Linux, check the USB device and its driver.
+
+```sh
+uname -r
+lsusb -d 05ac:
+lsusb -t
+./target/release/usb-transfer doctor
+```
+
+Look for the Mac's Apple USB ID in `lsusb`, `Driver=cdc_ncm` in `lsusb -t`, and a ready cable interface in `doctor`. A rate of `480M` in the USB tree is USB 2.0 High-Speed. Upstream Linux 7.3 includes the Mac `05ac:1902` and `05ac:1905` entries. The `05ac:1903` entry was added separately. Distribution kernels can backport these entries, so check the driver on the actual computer. [Linux 7.3 driver](https://github.com/torvalds/linux/blob/v7.3/drivers/net/usb/cdc_ncm.c) · [MacBook Air 1903 support](https://github.com/torvalds/linux/commit/a8d0451967fc0a34c4b0c21368986a81b4e14862)
+
+If Linux lists the USB device but the cable adapter is missing, `modinfo -F alias cdc_ncm` can show which Apple IDs the installed module matches. An alias includes both the vendor and product, such as `v05ACp1902`. If the adapter exists but is down, enable it in the Linux network settings. Once both computers have usable addresses on the cable, begin pairing. The manual address setup below also works for Mac ↔ Linux.
+
+### Ubuntu 26.04 LTS with the generic 7.0 kernel
+
+If your Mac enumerates as `05ac:1902`, `05ac:1903`, or `05ac:1905` but your running kernel has no matching `cdc_ncm` alias, the build helper can backport the upstream device entries to the matching Canonical module. This keeps your existing Ubuntu install and kernel. The helper builds locally as a regular user. Canonical's TPM-backed full-disk encryption installation uses a kernel snap that restricts out-of-tree modules. [Canonical module rebuild guide](https://ubuntu.com/kernel/docs/how-to/develop-customise/build-kernel-module/) · [Ubuntu 26.04 kernel snap limitations](https://documentation.ubuntu.com/release-notes/26.04/changes-since-previous-interim/)
+
+For the standard Ubuntu generic kernel, install the build dependencies and fetch source for the installed module package. Run `apt source` with Ubuntu source repositories enabled. Use the extracted directory reported by `apt source` in the final command.
+
+```bash
+kernel=$(uname -r)
+sudo apt update
+sudo apt install build-essential dpkg-dev dkms kmod python3 "linux-headers-$kernel"
+source_version=$(dpkg-query -W -f='${source:Version}' "linux-modules-$kernel")
+source_work=$(mktemp -d)
+(cd "$source_work" && apt source "linux=$source_version")
+bash scripts/ubuntu-26.04-cdc-ncm.sh "$source_work/linux-7.0.0"
+```
+
+The helper checks that the Ubuntu source version and headers match the running kernel. Its output is under `target/ubuntu-26.04-cdc-ncm/$kernel` unless you supply a destination. The output includes the patched module source, a DKMS configuration locked to that kernel, and a build of `cdc_ncm.ko` with all six Mac control-interface aliases.
+
+To install the backport, let Ubuntu DKMS build and sign it. If Ubuntu prompts you to enroll its local Machine Owner Key (MOK), complete enrollment at the next reboot with Secure Boot enabled. [Ubuntu DKMS manual](https://manpages.ubuntu.com/manpages/resolute/man8/dkms.8.html) · [Ubuntu Secure Boot module signing](https://documentation.ubuntu.com/security/security-features/platform-protections/secure-boot/)
+
+```bash
+module_dir="$PWD/target/ubuntu-26.04-cdc-ncm/$kernel"
+sudo dkms install "$module_dir" -k "$kernel"
+modinfo -k "$kernel" -F filename cdc_ncm
+modinfo -k "$kernel" -F signer cdc_ncm
+```
+
+After rebooting, plug in the Mac and check `lsusb -t` and `usb-transfer doctor`. For rollback, use `dkms status -m usb-direct-transfer-cdc-ncm` to find the installed package version, then run `sudo dkms remove -m usb-direct-transfer-cdc-ncm -v VERSION -k "$(uname -r)"` and reboot. DKMS restores the stock module. Kernel updates have their own module directory. Check the installed driver again after an update, and rebuild against the new kernel's matching source if the Apple ID is still missing.
 
 ## Connect and transfer
 
@@ -44,6 +88,6 @@ cargo test --locked --release encrypted_loopback_transfers_a_file_larger_than_fo
 
 The encrypted integration tests use localhost. The large-file test uses a 4 GiB sparse source and writes a full copy to the temporary directory.
 
-On the Mac and Windows hardware, verify transfers in both directions over the actual charging cable. Include a batch of files and folders, conflicting and Unicode names, and a file larger than 4 GiB. Leave Wi-Fi on during an unplug test, confirm the session ends, and check that a retry after restarting the app reuses verified staged data. For desktop verification, also pair the GUI with the CLI and test sending and receiving in both directions.
+On the Mac and Linux hardware, verify CLI transfers in both directions over the actual charging cable first. Include a batch of files and folders, conflicting and Unicode names, and a file larger than 4 GiB. Leave Wi-Fi on during an unplug test, confirm the session ends, and check that a retry after restarting the app reuses verified staged data. For desktop verification, repeat the workflow with both apps and pair the GUI with the CLI in both directions.
 
 For a raw TCP baseline, run `usb-transfer bench --mib 512` on both peers with the same size, adding the same interface and peer options as for pairing if needed. Compare the directional MiB/s with a large encrypted, verified file copy on the same cable, using fast local storage. Use 80% of the raw baseline as a tuning reference.

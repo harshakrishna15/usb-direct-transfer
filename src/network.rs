@@ -73,7 +73,7 @@ pub struct Interface {
     pub status: String,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Address {
     ip: IpAddr,
     prefix: u8,
@@ -320,6 +320,31 @@ fn pin(socket: &SockRef<'_>, address: Address, _datagram: bool) -> io::Result<()
     }
 }
 
+#[cfg(target_os = "linux")]
+fn pin_accepted(stream: &TcpStream, address: Address) -> io::Result<()> {
+    // Linux TCP inherits the listener's binding. Setting an already-bound interface
+    // requires CAP_NET_RAW, even when setting the same interface index again.
+    let socket = SockRef::from(stream);
+    let index = if address.ip.is_ipv4() {
+        socket.device_index_v4()?
+    } else {
+        socket.device_index_v6()?
+    };
+    if index.is_some_and(|index| index.get() == address.index) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Accepted socket did not inherit the cable interface binding",
+        ))
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pin_accepted(stream: &TcpStream, address: Address) -> io::Result<()> {
+    pin(&SockRef::from(stream), address, false)
+}
+
 #[cfg(windows)]
 fn pin(socket: &SockRef<'_>, address: Address, datagram: bool) -> io::Result<()> {
     use std::os::windows::io::AsRawSocket;
@@ -455,7 +480,7 @@ impl Endpoint {
             return Ok(None);
         }
         stream.set_nonblocking(false)?;
-        pin(&SockRef::from(&stream), self.address, false)?;
+        pin_accepted(&stream, self.address)?;
         preface_limits(&stream)?;
         let mut magic = [0; 8];
         if stream.read_exact(&mut magic).is_err() {
@@ -832,13 +857,18 @@ fn link_checker(_name: String, address: Address) -> Result<impl Fn() -> bool + S
 
 #[cfg(target_os = "linux")]
 fn link_checker(name: String, address: Address) -> Result<impl Fn() -> bool + Send + 'static> {
-    let interface = std::path::Path::new("/sys/class/net").join(&name);
-    let carrier = interface.join("carrier");
-    let index = interface.join("ifindex");
+    let carrier = std::path::Path::new("/sys/class/net")
+        .join(&name)
+        .join("carrier");
     Ok(move || {
         std::fs::read_to_string(&carrier).is_ok_and(|value| value.trim() == "1")
-            && std::fs::read_to_string(&index)
-                .is_ok_and(|value| value.trim().parse() == Ok(address.index))
+            && linux_links(Some(&name)).is_ok_and(|links| {
+                links.iter().any(|link| {
+                    link.ifname == name
+                        && link.up()
+                        && link.addresses().any(|entry| entry == address)
+                })
+            })
     })
 }
 
@@ -1016,6 +1046,9 @@ fn parse_mac(ifconfig: &str, ioreg: &str) -> Scan {
             addresses,
         });
     }
+    // The public Apple NCM pair is exposed as en*, ahead of the anpi* private pair.
+    scan.cables
+        .sort_by_key(|cable| cable.kind == "USB" && cable.name.starts_with("anpi"));
     scan
 }
 
@@ -1147,70 +1180,156 @@ fn parse_windows(output: &str) -> Result<Scan> {
 
 #[cfg(target_os = "linux")]
 fn scan() -> Result<Scan> {
-    let mut ip = Command::new("ip");
+    use std::path::Path;
+
+    Ok(scan_linux(
+        linux_links(None)?,
+        Path::new("/sys/class/net"),
+        Path::new("/sys/bus/usb/devices"),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_links(name: Option<&str>) -> Result<Vec<LinuxLink>> {
+    use std::path::Path;
+
+    let executable = ["/usr/sbin/ip", "/usr/bin/ip", "/sbin/ip", "/bin/ip"]
+        .into_iter()
+        .find(|path| Path::new(path).is_file())
+        .unwrap_or("ip");
+    let mut ip = Command::new(executable);
     ip.args(["-j", "address", "show"]);
-    let ip: Vec<serde_json::Value> = serde_json::from_str(&command(ip, "ip address")?)?;
-    let mut scan = Scan::default();
-    for entry in ip {
-        let Some(name) = entry["ifname"].as_str() else {
-            continue;
-        };
-        let Some(index) = entry["ifindex"]
-            .as_u64()
-            .and_then(|index| u32::try_from(index).ok())
-        else {
-            continue;
-        };
-        let path = std::path::Path::new("/sys/class/net")
-            .join(name)
-            .join("device");
-        let Ok(driver) = std::fs::read_link(path.join("driver")) else {
-            continue;
-        };
-        let Some(driver) = driver.file_name().and_then(|file| file.to_str()) else {
-            continue;
-        };
-        let kind = if driver == "thunderbolt-net" {
-            "Thunderbolt/USB4"
-        } else if driver == "cdc_ncm" {
-            let Ok(path) = std::fs::canonicalize(path) else {
-                continue;
-            };
-            let Some(parent) = path.parent() else {
-                continue;
-            };
-            let vendor = std::fs::read_to_string(parent.join("idVendor")).unwrap_or_default();
-            let product = std::fs::read_to_string(parent.join("idProduct")).unwrap_or_default();
-            if vendor.trim() != "05ac" || !matches!(product.trim(), "1902" | "1903" | "1905") {
-                continue;
-            }
-            "USB"
-        } else {
-            continue;
-        };
-        let up = entry["flags"]
-            .as_array()
-            .is_some_and(|flags| flags.iter().any(|flag| flag == "LOWER_UP"))
-            && entry["operstate"] == "UP";
-        let addresses = entry["addr_info"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|address| {
-                let ip = address["local"].as_str()?.parse().ok()?;
-                let prefix = u8::try_from(address["prefixlen"].as_u64()?).ok()?;
-                usable(ip).then_some(Address { ip, prefix, index })
-            })
-            .collect();
-        scan.cables.push(Cable {
-            name: name.into(),
-            kind,
-            driver: driver.into(),
-            up,
-            addresses,
-        });
+    if let Some(name) = name {
+        ip.args(["dev", name]);
     }
-    Ok(scan)
+    let output =
+        command(ip, "ip address").context("Linux interface discovery requires iproute2")?;
+    serde_json::from_str(&output).context("Could not read Linux address information")
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+#[derive(serde::Deserialize)]
+struct LinuxLink {
+    ifname: String,
+    ifindex: u32,
+    #[serde(default)]
+    flags: Vec<String>,
+    #[serde(default)]
+    operstate: String,
+    #[serde(default)]
+    addr_info: Vec<LinuxAddress>,
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+#[derive(serde::Deserialize)]
+struct LinuxAddress {
+    #[serde(default)]
+    local: String,
+    #[serde(default)]
+    prefixlen: u8,
+    #[serde(default)]
+    tentative: bool,
+    #[serde(default)]
+    dadfailed: bool,
+    #[serde(default)]
+    deprecated: bool,
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+impl LinuxLink {
+    fn up(&self) -> bool {
+        let has = |flag| self.flags.iter().any(|value| value == flag);
+        has("UP") && has("LOWER_UP") && matches!(self.operstate.as_str(), "UP" | "UNKNOWN")
+    }
+
+    fn addresses(&self) -> impl Iterator<Item = Address> + '_ {
+        self.addr_info.iter().filter_map(|address| {
+            if address.tentative || address.dadfailed || address.deprecated {
+                return None;
+            }
+            let ip: IpAddr = address.local.parse().ok()?;
+            let prefix = address.prefixlen;
+            let direct_prefix = if ip.is_ipv4() { 1..=31 } else { 1..=127 };
+            (usable(ip) && direct_prefix.contains(&prefix)).then_some(Address {
+                ip,
+                prefix,
+                index: self.ifindex,
+            })
+        })
+    }
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn scan_linux(
+    links: Vec<LinuxLink>,
+    net_root: &std::path::Path,
+    usb_root: &std::path::Path,
+) -> Scan {
+    use std::fs;
+
+    let mut ranked = Vec::new();
+    for link in links {
+        let name = link.ifname.as_str();
+        if link.ifindex == 0 || name.contains('/') || matches!(name, "" | "." | "..") {
+            continue;
+        }
+        let device = net_root.join(name).join("device");
+        let Ok(usb_driver) = fs::read_link(device.join("driver")) else {
+            continue;
+        };
+        let (kind, driver, private) = match usb_driver.file_name().and_then(|name| name.to_str()) {
+            Some("thunderbolt-net") => ("Thunderbolt/USB4", "thunderbolt-net".to_owned(), false),
+            Some("cdc_ncm") => {
+                let Ok(interface) = fs::canonicalize(&device) else {
+                    continue;
+                };
+                let Some(product) = interface.parent().and_then(apple_ncm_product) else {
+                    continue;
+                };
+                let number =
+                    fs::read_to_string(interface.join("bInterfaceNumber")).unwrap_or_default();
+                let private = number.trim() != "00";
+                ("USB", format!("cdc_ncm 05ac:{product}"), private)
+            }
+            _ => continue,
+        };
+        ranked.push((
+            private,
+            Cable {
+                name: name.into(),
+                kind,
+                driver,
+                up: link.up(),
+                addresses: link.addresses().collect(),
+            },
+        ));
+    }
+    ranked.sort_by_key(|(private, _)| *private);
+    let cables: Vec<_> = ranked.into_iter().map(|(_, cable)| cable).collect();
+
+    let mut devices = Vec::new();
+    if let Ok(entries) = fs::read_dir(usb_root) {
+        for entry in entries.flatten() {
+            if let Some(product) = apple_ncm_product(&entry.path()) {
+                devices.push(format!("Apple USB device 05ac:{product} detected"));
+            }
+        }
+    }
+    devices.sort_unstable();
+    devices.dedup();
+    if !devices.is_empty() && !cables.iter().any(|cable| cable.kind == "USB") {
+        devices.push("The Mac enumerated over USB but no supported cdc_ncm network adapter appeared. Check whether the running Linux kernel supports this device ID.".into());
+    }
+    Scan { cables, devices }
+}
+
+#[cfg(any(target_os = "linux", all(test, unix)))]
+fn apple_ncm_product(device: &std::path::Path) -> Option<String> {
+    let vendor = std::fs::read_to_string(device.join("idVendor")).ok()?;
+    let product = std::fs::read_to_string(device.join("idProduct")).ok()?;
+    let product = product.trim();
+    (vendor.trim().eq_ignore_ascii_case("05ac") && matches!(product, "1902" | "1903" | "1905"))
+        .then(|| product.to_owned())
 }
 
 #[cfg(not(any(target_os = "macos", windows, target_os = "linux")))]
@@ -1269,6 +1388,114 @@ mod tests {
             peer: Some("169.254.8.1".into()),
         };
         assert_eq!(select(&scan, &options).unwrap().0, "en3");
+    }
+
+    #[test]
+    fn macos_prefers_the_public_ncm_pair() {
+        let ifconfig = "anpi2: flags=1<UP> index 10\n\tstatus: active\n\tinet6 fe80::1%anpi2 prefixlen 64\n\
+                        en7: flags=1<UP> index 11\n\tstatus: active\n\tinet6 fe80::2%en7 prefixlen 64\n";
+        let ioreg = "  +-o AppleUSBDeviceNCM11Data <class AppleUSBDeviceNCM11Data>\n\
+                        \x20   +-o anpi2 <class IOEthernetInterface, id 0x123>\n\
+                        \x20   +-o en7 <class IOEthernetInterface, id 0x124>\n";
+        let scan = parse_mac(ifconfig, ioreg);
+        assert_eq!(select(&scan, &Options::default()).unwrap().0, "en7");
+        let private = Options {
+            interface: Some("anpi2".into()),
+            peer: None,
+        };
+        assert_eq!(select(&scan, &private).unwrap().0, "anpi2");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn linux_filters_adapters_and_uses_the_public_ncm_pair() {
+        use std::{fs, os::unix::fs::symlink};
+
+        let fixture = tempfile::tempdir().unwrap();
+        let net = fixture.path().join("net");
+        let usb = fixture.path().join("usb");
+        let apple = usb.join("1-1");
+        let generic = usb.join("1-2");
+        for (device, vendor, product) in [(&apple, "05ac", "1902"), (&generic, "1234", "1902")] {
+            fs::create_dir_all(device).unwrap();
+            fs::write(device.join("idVendor"), vendor).unwrap();
+            fs::write(device.join("idProduct"), product).unwrap();
+        }
+        for (name, device, child, number) in [
+            ("enx-private", &apple, "1-1:1.2", "02"),
+            ("enx-public", &apple, "1-1:1.0", "00"),
+            ("enx-external", &generic, "1-2:1.0", "00"),
+        ] {
+            let interface = device.join(child);
+            fs::create_dir(&interface).unwrap();
+            fs::write(interface.join("bInterfaceNumber"), number).unwrap();
+            symlink("/sys/bus/usb/drivers/cdc_ncm", interface.join("driver")).unwrap();
+            fs::create_dir_all(net.join(name)).unwrap();
+            symlink(&interface, net.join(name).join("device")).unwrap();
+        }
+
+        let links = serde_json::from_str(
+            r#"[
+          {"ifindex":10,"ifname":"enx-private","operstate":"UP","flags":["UP","LOWER_UP"],
+           "addr_info":[{"local":"fe80::4","prefixlen":64}]},
+          {"ifindex":11,"ifname":"enx-public","operstate":"UNKNOWN","flags":["UP","LOWER_UP"],
+           "addr_info":[{"local":"fe80::5","prefixlen":64,"tentative":true},
+                        {"local":"fe80::6","prefixlen":64,"dadfailed":true},
+                        {"local":"fe80::7","prefixlen":64,"deprecated":true},
+                        {"local":"fe80::8","prefixlen":64}]},
+          {"ifindex":12,"ifname":"enx-external","operstate":"UP","flags":["UP","LOWER_UP"],
+           "addr_info":[{"local":"fe80::9","prefixlen":64}]}
+        ]"#,
+        )
+        .unwrap();
+        let scan = scan_linux(links, &net, &usb);
+        assert_eq!(scan.cables.len(), 2);
+        assert_eq!(scan.devices, ["Apple USB device 05ac:1902 detected"]);
+        let (name, addresses, _) = select(&scan, &Options::default()).unwrap();
+        assert_eq!(name, "enx-public");
+        assert_eq!(addresses.len(), 1);
+        assert_eq!(
+            addresses[0].socket(SESSION_PORT).to_string(),
+            "[fe80::8%11]:48393"
+        );
+
+        let no_adapters = scan_linux(Vec::new(), &net, &usb);
+        assert!(
+            no_adapters
+                .devices
+                .iter()
+                .any(|entry| entry.contains("no supported cdc_ncm"))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_accept_inherits_the_listener_device_binding() {
+        // The loopback interface is always present in the Linux network namespace.
+        let index = unsafe { libc::if_nametoindex(c"lo".as_ptr()) };
+        assert_ne!(index, 0);
+        let address = Address {
+            ip: Ipv4Addr::LOCALHOST.into(),
+            prefix: 8,
+            index,
+        };
+        let listener = socket(address, Type::STREAM, Protocol::TCP).unwrap();
+        listener.bind(&address.socket(0).into()).unwrap();
+        listener.listen(1).unwrap();
+        let listener = TcpListener::from(listener);
+        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        assert!(pin_accepted(&accepted, address).is_ok());
+        assert!(
+            pin_accepted(
+                &accepted,
+                Address {
+                    index: 0,
+                    ..address
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]
