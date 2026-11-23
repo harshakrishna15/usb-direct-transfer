@@ -340,7 +340,8 @@ struct FrameBuffer(Vec<u8>);
 impl Write for FrameBuffer {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
         if bytes.len() > MAX_FRAME + 4 - self.0.len() {
-            return Err(io::Error::other(
+            return Err(io::Error::new(
+                io::ErrorKind::FileTooLarge,
                 "Transfer metadata exceeds the 16 MiB batch limit. Try a smaller batch.",
             ));
         }
@@ -531,8 +532,19 @@ impl Preparation {
         let (ready, prepared) = mpsc::channel();
         let cancelled = Arc::clone(&self.cancelled);
         thread::spawn(move || {
-            let offer = transfer::prepare(&paths, &cancelled).and_then(|batch| {
-                let frame = encode_frame(Frame::Offer(&batch.manifest))?;
+            let offer = transfer::prepare(&paths, &cancelled).and_then(|mut batch| {
+                let frame = match encode_frame(Frame::Offer(&batch.manifest)) {
+                    Err(error)
+                        if error
+                            .downcast_ref::<serde_json::Error>()
+                            .and_then(serde_json::Error::io_error_kind)
+                            == Some(io::ErrorKind::FileTooLarge)
+                            && batch.omit_checkpoints() =>
+                    {
+                        encode_frame(Frame::Offer(&batch.manifest))
+                    }
+                    result => result,
+                }?;
                 Ok(PreparedOffer { batch, frame })
             });
             let _ = ready.send(offer);
@@ -780,7 +792,9 @@ mod tests {
     }
 
     #[test]
-    fn canceling_a_download_preserves_verified_files_for_retry() -> Result<()> {
+    fn canceling_a_download_preserves_verified_files_and_checkpoints_for_retry() -> Result<()> {
+        use std::io::{Seek, SeekFrom};
+
         let temp = tempfile::tempdir()?;
         let root = temp.path();
         let folder = root.join("batch");
@@ -789,8 +803,17 @@ mod tests {
         fs::create_dir(&output)?;
         let first = b"already verified";
         fs::write(folder.join("a.txt"), first)?;
-        let large_size = 4 * 1024 * 1024;
-        fs::File::create(folder.join("b.bin"))?.set_len(large_size)?;
+        let large_path = folder.join("b.bin");
+        let large_size = 40 * 1024 * 1024;
+        let checkpoint = 16 * 1024 * 1024;
+        let mut large = fs::File::create(&large_path)?;
+        large.set_len(large_size)?;
+        large.write_all(b"first block")?;
+        large.seek(SeekFrom::Start(checkpoint))?;
+        large.write_all(b"second block")?;
+        large.seek(SeekFrom::End(-4))?;
+        large.write_all(b"tail")?;
+        drop(large);
         let batch = transfer::prepare(std::slice::from_ref(&folder), &AtomicBool::new(false))?;
 
         let (sender, receiver) = loopback();
@@ -807,7 +830,7 @@ mod tests {
             let (mut stream, _) = secure(receiver, false)?;
             let received =
                 transfer::receive(&mut stream, &batch.manifest, &output, |done, total| {
-                    if done > first.len() as u64 && done < total {
+                    if done >= first.len() as u64 + 20 * 1024 * 1024 && done < total {
                         control.close(true);
                     }
                 });
@@ -825,7 +848,10 @@ mod tests {
             Ok(())
         })?;
         assert!(!output.join("batch").exists());
-        assert_eq!(transfer::pending(&output)?[0].bytes, first.len() as u64);
+        let pending = transfer::pending(&output)?;
+        assert_eq!(pending[0].bytes, first.len() as u64);
+        assert!(pending[0].partial_bytes >= 20 * 1024 * 1024);
+        assert!(pending[0].partial_bytes < large_size);
 
         let (left, right) = connected(root);
         pair(&left, &right);
@@ -839,7 +865,7 @@ mod tests {
             } => Some(done),
             _ => None,
         });
-        assert_eq!(reused, first.len() as u64);
+        assert_eq!(reused, first.len() as u64 + checkpoint);
         right.next(|event| {
             matches!(
                 event,
@@ -851,7 +877,7 @@ mod tests {
             .then_some(())
         });
         assert_eq!(fs::read(output.join("batch/a.txt"))?, first);
-        assert_eq!(fs::metadata(output.join("batch/b.bin"))?.len(), large_size);
+        assert_eq!(fs::read(output.join("batch/b.bin"))?, fs::read(large_path)?);
         assert!(transfer::pending(&output)?.is_empty());
         Ok(())
     }

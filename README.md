@@ -98,7 +98,7 @@ If the pairing port is in use, a new attempt waits for it to become free. This a
 
 ## Retry or discard
 
-The transfer bar shows the bytes copied and estimates the time remaining once data starts moving. **Cancel transfer** stops the cable session and retains verified staged files on the destination drive, just as unplugging does. Pair again, send the same unchanged paths in the same order, and approve the same destination. The receiver verifies staged files before reusing them and restarts only files that were unfinished or no longer match. A received folder only appears in the destination after all of its files verify.
+The transfer bar shows the bytes copied and estimates the time remaining once data starts moving. **Cancel transfer** stops the cable session and retains staged data on the destination drive, just as unplugging does. Pair again, send the same unchanged paths in the same order, and approve the same destination. The receiver verifies completed files before reusing them. When both apps support checkpoints, retrying an interrupted large file resumes at its last verified checkpoint. A received folder only appears in the destination after all of its files verify.
 
 Open **Settings → Saved transfers** to review interrupted transfers for the selected save folder. Use **Retry last transfer** on the sending computer to resend the last batch from the open app. In the CLI, use `pending` and `discard ID` within a paired session, or run `usb-transfer pending --to DIR` and `usb-transfer discard ID --to DIR` separately. Discard removes the local staging data for that batch.
 

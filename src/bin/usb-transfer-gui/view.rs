@@ -652,7 +652,7 @@ impl Desktop {
                         self.detail = Some(Detail::TransferResult);
                     }
                 } else if !matches!(self.pairing, Pairing::Paired) {
-                    ui.weak("Pair again to retry. The receiver can reuse verified files.");
+                    ui.weak("Pair again to retry. The receiver rechecks any saved data.");
                 }
                 dismiss
             })
@@ -1044,7 +1044,19 @@ impl Desktop {
                                     let short_id = item.id.get(..8).unwrap_or(&item.id);
                                     ui.strong(format!("Transfer {short_id}"))
                                         .on_hover_text(&item.id);
-                                    ui.weak(format!("{} saved", size(item.bytes)));
+                                    let saved = if item.partial_bytes > 0 {
+                                        format!(
+                                            "{} saved · {} partial",
+                                            size(item.bytes),
+                                            size(item.partial_bytes)
+                                        )
+                                    } else {
+                                        format!("{} saved", size(item.bytes))
+                                    };
+                                    ui.add(
+                                        egui::Label::new(RichText::new(&saved).weak()).truncate(),
+                                    )
+                                    .on_hover_text(saved);
                                 });
                             },
                         );

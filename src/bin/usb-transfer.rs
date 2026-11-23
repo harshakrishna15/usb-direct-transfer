@@ -154,7 +154,14 @@ fn list_pending(to: &Path) -> Result<()> {
         println!("No pending transfers.");
     }
     for entry in entries {
-        println!("{}  {} bytes stored", entry.id, entry.bytes);
+        if entry.partial_bytes > 0 {
+            println!(
+                "{}  {} bytes stored, {} partial bytes",
+                entry.id, entry.bytes, entry.partial_bytes
+            );
+        } else {
+            println!("{}  {} bytes stored", entry.id, entry.bytes);
+        }
     }
     Ok(())
 }
