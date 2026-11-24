@@ -1,4 +1,5 @@
 mod resume;
+mod staging_batch;
 
 use anyhow::{Context, Result, bail, ensure};
 use filetime::FileTime;
@@ -588,6 +589,8 @@ pub fn receive(
             directory.join(saved)
         };
         for (entry, mapped) in root.entries.iter().zip(&state.paths[index]) {
+            let file_index = next_index;
+            next_index += 1;
             tick()?;
             let saved_path = checked_path(&saved_root, mapped)?;
             if let Kind::File { bytes, sha256 } = &entry.kind {
@@ -597,9 +600,21 @@ pub fn receive(
                         "Previously published data changed: {}",
                         display_path(&saved_path)
                     );
+                    let part = resume::path(&stage, file_index);
+                    if *bytes <= staging_batch::MAX_SMALL_FILE
+                        && staging_batch::recover(
+                            &part,
+                            &saved_path,
+                            *bytes,
+                            sha256,
+                            &mut buffer,
+                            &mut tick,
+                        )?
+                    {
+                        continue;
+                    }
                     let (prefix, offset) =
-                        if let Some(checkpoints) = manifest.checkpoints.get(&next_index) {
-                            let part = resume::path(&stage, next_index);
+                        if let Some(checkpoints) = manifest.checkpoints.get(&file_index) {
                             let prefix = checkpoints.verify_saved(&part, &mut buffer, &mut tick)?;
                             let offset = prefix
                                 .as_ref()
@@ -609,7 +624,7 @@ pub fn receive(
                             (None, 0)
                         };
                     requests.push(FileRequest {
-                        index: next_index,
+                        index: file_index,
                         path: saved_path,
                         bytes: *bytes,
                         sha256,
@@ -621,7 +636,6 @@ pub fn receive(
             } else {
                 require_directory(&saved_path)?;
             }
-            next_index += 1;
         }
     }
 
@@ -648,14 +662,28 @@ pub fn receive(
     }
     let mut completed = total - remaining;
     progress(completed, total);
-    for request in requests {
-        let keep_partial = manifest.checkpoints.contains_key(&request.index);
-        receive_file(stream, &stage, request, keep_partial, &mut buffer, |size| {
-            completed += size;
-            progress(completed, total);
-            Ok(())
-        })?;
-    }
+    let mut small_files = staging_batch::Batch::default();
+    let received = (|| -> Result<()> {
+        for request in requests {
+            let keep_partial = manifest.checkpoints.contains_key(&request.index);
+            receive_file(
+                stream,
+                &stage,
+                request,
+                keep_partial,
+                &mut buffer,
+                &mut small_files,
+                |size| {
+                    completed += size;
+                    progress(completed, total);
+                    Ok(())
+                },
+            )?;
+        }
+        Ok(())
+    })();
+    // Preserve the verified members of the final group on interruption too.
+    received.and(small_files.flush(&stage))?;
 
     let mut tick = || preparing_pulse(stream, &mut next_pulse);
     let mut reserved = HashSet::new();
@@ -735,6 +763,7 @@ fn receive_file(
     request: FileRequest<'_>,
     keep_partial: bool,
     buffer: &mut [u8],
+    small_files: &mut staging_batch::Batch,
     copied: impl FnMut(u64) -> Result<()>,
 ) -> Result<()> {
     let FileRequest {
@@ -745,6 +774,10 @@ fn receive_file(
         prefix,
         offset,
     } = request;
+    let grouped = !keep_partial && bytes <= staging_batch::MAX_SMALL_FILE;
+    if !grouped {
+        small_files.flush(stage)?;
+    }
     let verify = |actual: &str| -> Result<()> {
         ensure!(
             actual == sha256,
@@ -783,6 +816,9 @@ fn receive_file(
             .tempfile_in(stage)?;
         let actual = copy_exact(stream, part.as_file_mut(), bytes, buffer, copied)?;
         verify(&actual)?;
+        if grouped {
+            return small_files.add(stage, index, path, part);
+        }
         part.as_file().sync_all()?;
         part.persist(&path).map_err(|error| error.error)?;
     }
@@ -1758,6 +1794,33 @@ mod tests {
         assert_eq!(fs::read(to.path().join("photo (2).jpg"))?, b"1");
         assert_eq!(fs::read(to.path().join("photo (3).jpg"))?, b"2");
         assert_eq!(fs::read(to.path().join(third))?, b"3");
+        confirm_receipt(to.path(), &prepared.manifest)
+    }
+
+    #[test]
+    fn reuses_completed_small_files_left_before_group_sync() -> Result<()> {
+        let source = tempfile::tempdir()?;
+        let folder = source.path().join("batch");
+        fs::create_dir(&folder)?;
+        fs::write(folder.join("a.txt"), b"first")?;
+        fs::write(folder.join("b.txt"), b"second")?;
+        let prepared = prepare(&[folder])?;
+        let to = tempfile::tempdir()?;
+        let (_, base) = staging_base(to.path(), true)?;
+        let stage = base.join(prepared.manifest.id()?);
+        initialize_stage(&base, &stage, &prepared.manifest, || Ok(()))?;
+        fs::write(resume::path(&stage, 1), b"first")?;
+        fs::write(resume::path(&stage, 2), b"wrong!")?;
+
+        let mut exchange = Exchange::new(b"second");
+        let mut initial = None;
+        receive(&mut exchange, &prepared.manifest, to.path(), |done, _| {
+            initial.get_or_insert(done);
+        })?;
+        assert_eq!(initial, Some(5));
+        assert_eq!(exchange.requests(), [1, 2, PUBLISHED as u32]);
+        assert_eq!(fs::read(to.path().join("batch/a.txt"))?, b"first");
+        assert_eq!(fs::read(to.path().join("batch/b.txt"))?, b"second");
         confirm_receipt(to.path(), &prepared.manifest)
     }
 

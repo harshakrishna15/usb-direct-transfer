@@ -142,7 +142,7 @@ pub(super) fn open(path: &Path) -> Result<File> {
         );
     }
     let mut options = OpenOptions::new();
-    options.write(true).create(true).truncate(false);
+    options.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
