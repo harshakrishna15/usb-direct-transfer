@@ -217,6 +217,7 @@ fn interactive(options: Options, to: &Path) -> Result<()> {
                     last_progress = Some(now);
                 }
             }
+            Ok(Event::Preparing { .. }) => {}
             Ok(event) => {
                 if in_progress {
                     println!();
@@ -293,7 +294,7 @@ fn interactive(options: Options, to: &Path) -> Result<()> {
                             None => Ok(()),
                         };
                     }
-                    Event::Progress { .. } => unreachable!(),
+                    Event::Preparing { .. } | Event::Progress { .. } => unreachable!(),
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}

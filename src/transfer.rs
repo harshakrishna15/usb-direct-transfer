@@ -84,6 +84,7 @@ impl Modified {
 
 pub struct Prepared {
     pub manifest: Manifest,
+    pub(crate) bytes: u64,
     sources: Vec<Option<Source>>,
 }
 
@@ -168,11 +169,12 @@ impl FileIdentity {
 struct SourceScan {
     files: Vec<Option<Source>>,
     skipped: Vec<String>,
+    file_count: usize,
     bytes: u64,
 }
 
 impl Prepared {
-    pub(crate) fn preview(&self, bytes: u64) -> OfferPreview {
+    pub(crate) fn preview(&self) -> OfferPreview {
         OfferPreview {
             names: self
                 .manifest
@@ -180,7 +182,7 @@ impl Prepared {
                 .iter()
                 .map(|root| root.name.clone())
                 .collect(),
-            bytes,
+            bytes: self.bytes,
         }
     }
 
@@ -315,13 +317,17 @@ pub(crate) fn prepare_with_preview(
     cancelled: &AtomicBool,
     preview: impl FnOnce(OfferPreview) -> Result<()>,
 ) -> Result<Prepared> {
-    let (mut batch, bytes) = scan_batch(paths, cancelled)?;
-    preview(batch.preview(bytes))?;
-    batch.finish_hashes(cancelled)?;
+    let mut batch = scan_batch(paths, cancelled, |_, _| {})?;
+    preview(batch.preview())?;
+    batch.finish_hashes(cancelled, |_, _| {})?;
     Ok(batch)
 }
 
-pub(crate) fn scan_batch(paths: &[PathBuf], cancelled: &AtomicBool) -> Result<(Prepared, u64)> {
+pub(crate) fn scan_batch(
+    paths: &[PathBuf],
+    cancelled: &AtomicBool,
+    mut scanned: impl FnMut(usize, u64),
+) -> Result<Prepared> {
     let mut manifest = Manifest {
         roots: Vec::new(),
         skipped: Vec::new(),
@@ -329,6 +335,7 @@ pub(crate) fn scan_batch(paths: &[PathBuf], cancelled: &AtomicBool) -> Result<(P
         stream_id: None,
     };
     let mut sources = SourceScan::default();
+    scanned(0, 0);
     for path in paths {
         ensure!(
             !cancelled.load(Ordering::Relaxed),
@@ -357,8 +364,15 @@ pub(crate) fn scan_batch(paths: &[PathBuf], cancelled: &AtomicBool) -> Result<(P
             entries: Vec::new(),
         };
         validate_component(name)?;
-        scan(path, Vec::new(), &mut root, &mut sources, cancelled)
-            .with_context(|| format!("Cannot read {}", display_path(path)))?;
+        scan(
+            path,
+            Vec::new(),
+            &mut root,
+            &mut sources,
+            cancelled,
+            &mut scanned,
+        )
+        .with_context(|| format!("Cannot read {}", display_path(path)))?;
         if !root.entries.is_empty() {
             manifest.roots.push(root);
         }
@@ -374,17 +388,33 @@ pub(crate) fn scan_batch(paths: &[PathBuf], cancelled: &AtomicBool) -> Result<(P
             .collect::<Vec<_>>()
             .join(", ")
     );
-    Ok((
-        Prepared {
-            manifest,
-            sources: sources.files,
-        },
-        sources.bytes,
-    ))
+    Ok(Prepared {
+        manifest,
+        bytes: sources.bytes,
+        sources: sources.files,
+    })
 }
 
 impl Prepared {
-    pub(crate) fn finish_hashes(&mut self, cancelled: &AtomicBool) -> Result<()> {
+    pub(crate) fn finish_hashes(
+        &mut self,
+        cancelled: &AtomicBool,
+        mut checked: impl FnMut(u64, u64),
+    ) -> Result<()> {
+        let total = self.bytes;
+        let mut done = 0;
+        checked(done, total);
+        let mut tick = |count| {
+            ensure!(
+                !cancelled.load(Ordering::Relaxed),
+                "Transfer preparation canceled"
+            );
+            if count > 0 {
+                done += count;
+                checked(done, total);
+            }
+            Ok(())
+        };
         self.manifest.stream_id = None;
         let manifest = &mut self.manifest;
         let mut remaining_checkpoints = resume::MAX_CHECKPOINTS;
@@ -406,7 +436,7 @@ impl Prepared {
                 entry.modified,
                 interval,
                 &mut buffer,
-                cancelled,
+                &mut tick,
             )
             .with_context(|| format!("Cannot prepare {}", display_path(&source.path)))?;
             *sha256 = hash;
@@ -436,6 +466,7 @@ fn scan(
     root: &mut Root,
     sources: &mut SourceScan,
     cancelled: &AtomicBool,
+    scanned: &mut impl FnMut(usize, u64),
 ) -> Result<()> {
     ensure!(
         !cancelled.load(Ordering::Relaxed),
@@ -497,7 +528,14 @@ fn scan(
             };
             let mut child_relative = relative.clone();
             child_relative.push(name.to_string());
-            scan(&child.path(), child_relative, root, sources, cancelled)?;
+            scan(
+                &child.path(),
+                child_relative,
+                root,
+                sources,
+                cancelled,
+                scanned,
+            )?;
         }
     } else if metadata.is_file() {
         let bytes = metadata.len();
@@ -518,6 +556,8 @@ fn scan(
             identity: FileIdentity::from(&metadata),
             checkpoint_states: Vec::new(),
         }));
+        sources.file_count += 1;
+        scanned(sources.file_count, sources.bytes);
     } else {
         sources.skipped.push(format!(
             "{} (special file)",
@@ -533,16 +573,9 @@ fn hash_source(
     modified: Modified,
     interval: u64,
     buffer: &mut [u8],
-    cancelled: &AtomicBool,
+    mut checked: impl FnMut(u64) -> Result<()>,
 ) -> Result<(String, Vec<digest::Context>)> {
-    let check_cancelled = || {
-        ensure!(
-            !cancelled.load(Ordering::Relaxed),
-            "Transfer preparation canceled"
-        );
-        Ok(())
-    };
-    check_cancelled()?;
+    checked(0)?;
     let mut file = open_regular(path)?;
     let before = file.metadata()?;
     ensure!(
@@ -560,7 +593,7 @@ fn hash_source(
             length,
             buffer,
             &mut hasher,
-            |_| check_cancelled(),
+            &mut checked,
         )?;
         remaining -= length;
         if remaining > 0 {
@@ -663,15 +696,31 @@ pub fn describe(manifest: &Manifest) -> Result<(Vec<String>, u64)> {
     ))
 }
 
-pub fn send(
+pub(crate) struct ResumeVerification<F> {
+    pub parallel: bool,
+    pub checked: F,
+}
+
+#[cfg(test)]
+impl ResumeVerification<fn(u64, u64)> {
+    pub(crate) fn silent(parallel: bool) -> Self {
+        Self {
+            parallel,
+            checked: |_, _| {},
+        }
+    }
+}
+
+pub(crate) fn send(
     stream: &mut impl ReadWrite,
     prepared: &Prepared,
+    resume: ResumeVerification<impl FnMut(u64, u64) + Send>,
     mut progress: impl FnMut(u64, u64),
 ) -> Result<()> {
-    let (_, total) = describe(&prepared.manifest)?;
     if prepared.manifest.is_streaming() {
-        return streaming::send(stream, prepared, total, progress);
+        return streaming::send(stream, prepared, resume, progress);
     }
+    let (_, total) = describe(&prepared.manifest)?;
     let entries: Vec<_> = prepared.manifest.entries().collect();
     let first = read_prepared(stream)?;
     let with_checkpoints = first == resume::REQUESTS_WITH_CHECKPOINTS;
@@ -835,6 +884,7 @@ pub(crate) fn receive(
     manifest: &Manifest,
     to: &Destination,
     cancelled: &AtomicBool,
+    resume: ResumeVerification<impl FnMut(u64, u64)>,
     mut progress: impl FnMut(u64, u64),
 ) -> Result<Summary> {
     let (_, total) = describe(manifest)?;
@@ -845,14 +895,17 @@ pub(crate) fn receive(
     let mut next_pulse = Instant::now() + Duration::from_secs(1);
     let mut tick = || preparing_pulse(stream, &mut next_pulse, cancelled);
     tick()?;
-    let mut state = if directory_exists(&stage)? {
+    let existing_stage = directory_exists(&stage)?;
+    let mut state = if existing_stage {
         read_state(&stage)?
     } else {
         initialize_stage(base, &stage, manifest, &mut tick)?
     };
     validate_state(&state, manifest)?;
-    remove_temporary_entries(&stage, ".partial-")?;
-    remove_temporary_entries(&stage, ".state-")?;
+    if existing_stage {
+        remove_temporary_entries(&stage, ".partial-")?;
+        remove_temporary_entries(&stage, ".state-")?;
+    }
     let mut summary = Summary {
         skipped: manifest
             .skipped
@@ -876,11 +929,18 @@ pub(crate) fn receive(
             })?;
             directory.join(saved)
         };
+        let mut directories: HashMap<&[String], PathBuf> = HashMap::new();
         for (entry, mapped) in root.entries.iter().zip(&state.paths[index]) {
             let file_index = next_index;
             next_index += 1;
             tick()?;
-            let saved_path = checked_path(&saved_root, mapped)?;
+            let saved_path = match mapped.split_last() {
+                Some((name, parent)) => directories
+                    .get(parent)
+                    .context("Missing staged parent directory")?
+                    .join(name),
+                None => saved_root.clone(),
+            };
             if let Kind::File { bytes, sha256 } = &entry.kind {
                 files.push(StagedFile {
                     index: file_index,
@@ -891,11 +951,20 @@ pub(crate) fn receive(
                 });
             } else {
                 require_directory(&saved_path)?;
+                directories.insert(mapped, saved_path);
             }
         }
     }
     if manifest.is_streaming() {
-        streaming::receive(stream, &stage, files, total, cancelled, &mut progress)?;
+        streaming::receive(
+            stream,
+            &stage,
+            files,
+            total,
+            cancelled,
+            existing_stage.then_some(resume),
+            &mut progress,
+        )?;
     } else {
         receive_prehashed_files(
             stream,
@@ -1629,12 +1698,14 @@ fn reserve_name(parent: &Path, original: &str, folder: bool) -> Result<String> {
     for copy in 1..=MAX_ENTRIES {
         let name = numbered_name(&base, folder, copy);
         let candidate = parent.join(&name);
-        if path_exists(&candidate)? {
-            continue;
-        }
         match create_item(&candidate, folder) {
             Ok(()) => return Ok(name),
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(error)
+                if error.kind() == io::ErrorKind::AlreadyExists
+                    || path_exists(&candidate).unwrap_or(false) =>
+            {
+                continue;
+            }
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("Cannot stage {}", display_path(&candidate)));
@@ -2176,6 +2247,7 @@ mod tests {
             manifest,
             &Destination::open(to)?,
             &AtomicBool::new(false),
+            ResumeVerification::silent(false),
             progress,
         )
     }
@@ -2463,7 +2535,15 @@ mod tests {
         fs::write(&file, "contents")?;
         let mut prepared = prepare(&[file])?;
         let mut transfer = Exchange::new(&[0, 0, 0, 1, 0, 0, 0, 32]);
-        assert!(send(&mut transfer, &prepared, |_, _| {}).is_err());
+        assert!(
+            send(
+                &mut transfer,
+                &prepared,
+                ResumeVerification::silent(false),
+                |_, _| {}
+            )
+            .is_err()
+        );
         assert!(transfer.outgoing.is_empty());
         prepared.manifest.roots[0].name = "..".to_string();
         assert!(describe(&prepared.manifest).is_err());
@@ -2509,7 +2589,7 @@ mod tests {
         let file = source.path().join("example.txt");
         fs::write(&file, b"payload")?;
         let paths = [file];
-        let (mut batch, _) = scan_batch(&paths, &AtomicBool::new(false))?;
+        let mut batch = scan_batch(&paths, &AtomicBool::new(false), |_, _| {})?;
         batch.enable_streaming(&paths)?;
         let destination = tempfile::tempdir()?;
 

@@ -1,20 +1,25 @@
 use super::{
-    CHUNK, Entry, FileIdentity, Kind, Modified, PUBLISHED, Prepared, ReadWrite, Source, StagedFile,
-    copy_and_hash_payload, copy_hashed, copy_payload, display_path, is_regular,
+    CHUNK, Entry, FileIdentity, Kind, Modified, PUBLISHED, Prepared, ReadWrite, ResumeVerification,
+    Source, StagedFile, copy_and_hash_payload, copy_hashed, copy_payload, display_path, is_regular,
     metadata_if_present, open_regular, preparation_pulse, preparing_pulse, read_integer,
     read_prepared, resume, staging_batch, sync_directory, write_integer,
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 use ring::digest;
 use std::collections::BTreeMap;
 use std::fs::{self, File, Metadata};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use std::{sync::mpsc, thread};
 
-// The receiver offers checkpoint hashes. The sender replies with the longest
-// verified prefix for each file, then sends remaining bytes and file hashes.
+// The receiver offers checkpoints. The sender replies with the longest verified
+// prefix for each file, then sends the remaining bytes and file hashes.
+// With parallel verification, offsets arrive first and digests are framed so
+// the receiver can send keepalives while it reads each checkpoint.
+const CHECKPOINT_READY: usize = 0;
+
 struct Prefix {
     bytes: u64,
     hasher: digest::Context,
@@ -22,10 +27,14 @@ struct Prefix {
 
 struct ProposedFile {
     index: usize,
-    checkpoints: Vec<(u64, [u8; 32])>,
+    checkpoints: Vec<(u64, Option<[u8; 32]>)>,
 }
 
-fn read_proposals(stream: &mut impl Read, entries: &[&Entry]) -> Result<Vec<ProposedFile>> {
+fn read_proposals(
+    stream: &mut impl Read,
+    entries: &[&Entry],
+    parallel_resume: bool,
+) -> Result<Vec<ProposedFile>> {
     let count = read_prepared(stream)?;
     ensure!(count <= entries.len(), "Invalid saved prefix count");
     let mut offered: Vec<ProposedFile> = Vec::with_capacity(count);
@@ -53,7 +62,12 @@ fn read_proposals(stream: &mut impl Read, entries: &[&Entry]) -> Result<Vec<Prop
                 (previous < offset) && offset <= *bytes,
                 "Invalid saved file length"
             );
-            checkpoints.push((offset, read_array::<32>(stream)?));
+            let expected = if parallel_resume {
+                None
+            } else {
+                Some(read_array::<32>(stream)?)
+            };
+            checkpoints.push((offset, expected));
             previous = offset;
         }
         offered.push(ProposedFile { index, checkpoints });
@@ -61,19 +75,17 @@ fn read_proposals(stream: &mut impl Read, entries: &[&Entry]) -> Result<Vec<Prop
     Ok(offered)
 }
 
-pub(super) fn send(
-    stream: &mut impl ReadWrite,
+fn verify_proposals(
     batch: &Prepared,
-    total: u64,
-    mut progress: impl FnMut(u64, u64),
-) -> Result<()> {
-    let entries: Vec<_> = batch.manifest.entries().collect();
-    let offered = read_proposals(stream, &entries)?;
-
+    entries: &[&Entry],
+    offered: &[ProposedFile],
+    buffer: &mut [u8],
+    mut hash: impl FnMut(Option<[u8; 32]>) -> Result<[u8; 32]>,
+    mut checked: impl FnMut(u64) -> Result<()>,
+) -> Result<BTreeMap<usize, Prefix>> {
     let mut accepted = BTreeMap::new();
-    let mut buffer = vec![0; CHUNK];
-    let mut next_pulse = Instant::now() + Duration::from_secs(1);
     for ProposedFile { index, checkpoints } in offered {
+        let index = *index;
         let source = batch.sources[index]
             .as_ref()
             .context("Missing source file")?;
@@ -86,29 +98,139 @@ pub(super) fn send(
         let mut hasher = digest::Context::new(&digest::SHA256);
         let mut previous = 0;
         let mut verified = None;
-        for (offset, expected) in checkpoints {
-            copy_hashed(
-                &mut file,
-                &mut io::sink(),
-                offset - previous,
-                &mut buffer,
-                &mut hasher,
-                |_| preparation_pulse(stream, &mut next_pulse),
-            )?;
-            if hasher.clone().finish().as_ref() != expected {
-                break;
+        let mut matching = true;
+        for &(offset, supplied) in checkpoints {
+            if matching {
+                copy_hashed(
+                    &mut file,
+                    &mut io::sink(),
+                    offset - previous,
+                    buffer,
+                    &mut hasher,
+                    &mut checked,
+                )?;
+            }
+            let expected = hash(supplied)?;
+            if matching && hasher.clone().finish().as_ref() == expected {
+                verified = Some(Prefix {
+                    bytes: offset,
+                    hasher: hasher.clone(),
+                });
+            } else {
+                matching = false;
             }
             previous = offset;
-            verified = Some(Prefix {
-                bytes: offset,
-                hasher: hasher.clone(),
-            });
         }
         check_source(&file, source, bytes, entry.modified)?;
         if let Some(prefix) = verified {
             accepted.insert(index, prefix);
         }
     }
+    Ok(accepted)
+}
+
+fn verify_in_parallel(
+    stream: &mut impl ReadWrite,
+    batch: &Prepared,
+    entries: &[&Entry],
+    offered: &[ProposedFile],
+    buffer: &mut [u8],
+    mut checked: impl FnMut(u64) + Send,
+) -> Result<BTreeMap<usize, Prefix>> {
+    let stopped = AtomicBool::new(false);
+    thread::scope(|scope| {
+        let (submit, hashes) = mpsc::channel();
+        let (finish, outcome) = mpsc::channel();
+        let cancelled = &stopped;
+        // The plan bounds the hash queue. Drain the receiver's results while a
+        // worker checks the source so neither disk blocks the network stream.
+        thread::Builder::new().spawn_scoped(scope, move || {
+            let verified = verify_proposals(
+                batch,
+                entries,
+                offered,
+                buffer,
+                |_| {
+                    hashes
+                        .recv()
+                        .context("Received saved checkpoints ended early")
+                },
+                |count| {
+                    ensure!(!cancelled.load(Ordering::Relaxed), "Transfer canceled");
+                    checked(count);
+                    Ok(())
+                },
+            );
+            let _ = finish.send(verified);
+        })?;
+
+        let result = (|| {
+            let count: usize = offered.iter().map(|file| file.checkpoints.len()).sum();
+            for _ in 0..count {
+                ensure!(
+                    read_prepared(stream)? == CHECKPOINT_READY,
+                    "Invalid saved checkpoint marker"
+                );
+                if submit.send(read_array::<32>(stream)?).is_err() {
+                    break;
+                }
+            }
+            drop(submit);
+            let mut next_pulse = Instant::now() + Duration::from_secs(1);
+            loop {
+                match outcome.recv_timeout(Duration::from_secs(1)) {
+                    Ok(result) => return result,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        preparation_pulse(stream, &mut next_pulse)?;
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        bail!("Source verification stopped");
+                    }
+                }
+            }
+        })();
+        stopped.store(true, Ordering::Relaxed);
+        result
+    })
+}
+
+pub(super) fn send(
+    stream: &mut impl ReadWrite,
+    batch: &Prepared,
+    mut resume: ResumeVerification<impl FnMut(u64, u64) + Send>,
+    mut progress: impl FnMut(u64, u64),
+) -> Result<()> {
+    let entries: Vec<_> = batch.manifest.entries().collect();
+    let offered = read_proposals(stream, &entries, resume.parallel)?;
+    let planned = offered
+        .iter()
+        .filter_map(|file| file.checkpoints.last().map(|(bytes, _)| bytes))
+        .sum();
+    let mut bytes_checked = 0;
+    let mut checked = |count| {
+        bytes_checked += count;
+        (resume.checked)(bytes_checked, planned);
+    };
+    if planned > 0 {
+        checked(0);
+    }
+    let mut buffer = vec![0; CHUNK];
+    let mut accepted = if resume.parallel && !offered.is_empty() {
+        verify_in_parallel(stream, batch, &entries, &offered, &mut buffer, checked)?
+    } else {
+        let mut next_pulse = Instant::now() + Duration::from_secs(1);
+        verify_proposals(
+            batch,
+            &entries,
+            &offered,
+            &mut buffer,
+            |expected| expected.context("Missing saved checksum"),
+            |count| {
+                checked(count);
+                preparation_pulse(stream, &mut next_pulse)
+            },
+        )?
+    };
     {
         let mut writer = io::BufWriter::new(&mut *stream);
         write_integer(&mut writer, accepted.len())?;
@@ -119,6 +241,7 @@ pub(super) fn send(
         writer.flush()?;
     }
 
+    let total = batch.bytes;
     let mut complete = accepted.values().map(|prefix| prefix.bytes).sum();
     progress(complete, total);
     let mut payload = vec![0; CHUNK];
@@ -209,6 +332,24 @@ struct SavedFile {
     at_target: bool,
 }
 
+struct SavedPlan {
+    path: PathBuf,
+    metadata: Metadata,
+    at_target: bool,
+    bytes: u64,
+    interval: u64,
+}
+
+impl SavedPlan {
+    fn offsets(&self) -> impl ExactSizeIterator<Item = u64> + '_ {
+        let count = self.bytes.div_ceil(self.interval) as usize;
+        (0..count).map(|index| {
+            self.bytes
+                .min(self.interval.saturating_mul(index as u64 + 1))
+        })
+    }
+}
+
 fn verify_saved_file(before: &Metadata, file: &File) -> Result<()> {
     let after = file.metadata()?;
     ensure!(
@@ -226,29 +367,75 @@ pub(super) fn receive(
     files: Vec<StagedFile<'_>>,
     total: u64,
     cancelled: &AtomicBool,
+    mut resume: Option<ResumeVerification<impl FnMut(u64, u64)>>,
     mut progress: impl FnMut(u64, u64),
 ) -> Result<()> {
-    let mut offered = BTreeMap::new();
     let mut buffer = vec![0; CHUNK];
     let mut next_pulse = Instant::now() + Duration::from_secs(1);
-    let mut tick = || preparing_pulse(stream, &mut next_pulse, cancelled);
-    let mut budget = resume::MAX_CHECKPOINTS;
-    for file in &files {
-        tick()?;
-        if let Some(saved) = saved_checkpoints(stage, file, budget, &mut buffer, &mut tick)? {
-            budget -= saved.checkpoints.len() - 1;
-            offered.insert(file.index, saved);
+    let parallel_resume = resume.as_ref().is_some_and(|resume| resume.parallel);
+    let mut plans = Vec::new();
+    if resume.is_some() {
+        let mut budget = resume::MAX_CHECKPOINTS;
+        for file in &files {
+            preparing_pulse(stream, &mut next_pulse, cancelled)?;
+            if let Some(plan) = saved_plan(stage, file, budget)? {
+                budget -= plan.offsets().len() - 1;
+                plans.push((file.index, plan));
+            }
         }
     }
+    let planned: u64 = plans.iter().map(|(_, plan)| plan.bytes).sum();
+    let mut bytes_checked = 0;
+    let mut checked = |count| {
+        bytes_checked += count;
+        if let Some(resume) = &mut resume {
+            (resume.checked)(bytes_checked, planned);
+        }
+    };
+    if planned > 0 {
+        checked(0);
+    }
+    let mut offered = BTreeMap::new();
     {
         let mut writer = io::BufWriter::new(&mut *stream);
-        write_integer(&mut writer, offered.len())?;
-        for (&index, saved) in &offered {
-            write_integer(&mut writer, index)?;
-            write_integer(&mut writer, saved.checkpoints.len())?;
-            for checkpoint in &saved.checkpoints {
-                writer.write_all(&checkpoint.bytes.to_be_bytes())?;
-                writer.write_all(checkpoint.hasher.clone().finish().as_ref())?;
+        if parallel_resume {
+            write_integer(&mut writer, plans.len())?;
+            for (index, plan) in &plans {
+                let offsets = plan.offsets();
+                write_integer(&mut writer, *index)?;
+                write_integer(&mut writer, offsets.len())?;
+                for offset in offsets {
+                    writer.write_all(&offset.to_be_bytes())?;
+                }
+            }
+            writer.flush()?;
+        }
+        for (index, plan) in plans {
+            let saved = hash_saved(plan, &mut buffer, |count, checkpoint| {
+                preparing_pulse(&mut writer, &mut next_pulse, cancelled)?;
+                if count > 0 {
+                    checked(count);
+                }
+                if parallel_resume && let Some(checkpoint) = checkpoint {
+                    write_integer(&mut writer, CHECKPOINT_READY)?;
+                    writer.write_all(checkpoint.hasher.clone().finish().as_ref())?;
+                    if checkpoint.bytes >= resume::MIN_INTERVAL {
+                        writer.flush()?;
+                    }
+                }
+                Ok(())
+            })?;
+            offered.insert(index, saved);
+        }
+        if !parallel_resume {
+            write_integer(&mut writer, offered.len())?;
+            for (&index, saved) in &offered {
+                write_integer(&mut writer, index)?;
+                write_integer(&mut writer, saved.checkpoints.len())?;
+                for checkpoint in &saved.checkpoints {
+                    writer.write_all(&checkpoint.bytes.to_be_bytes())?;
+                    writer.write_all(checkpoint.hasher.clone().finish().as_ref())?;
+                }
             }
         }
         writer.flush()?;
@@ -310,13 +497,7 @@ pub(super) fn receive(
     received.and(small_files.flush(stage))
 }
 
-fn saved_checkpoints(
-    stage: &Path,
-    file: &StagedFile<'_>,
-    budget: usize,
-    buffer: &mut [u8],
-    mut tick: impl FnMut() -> Result<()>,
-) -> Result<Option<SavedFile>> {
+fn saved_plan(stage: &Path, file: &StagedFile<'_>, budget: usize) -> Result<Option<SavedPlan>> {
     let saved = metadata_if_present(&file.path)?;
     if !file.is_staged {
         ensure!(
@@ -330,19 +511,19 @@ fn saved_checkpoints(
     if file.bytes == 0 {
         return Ok(None);
     }
-    let part = resume::path(stage, file.index);
-    let at_target =
-        saved.is_some_and(|metadata| is_regular(&metadata) && metadata.len() == file.bytes);
-    let path = if at_target { &file.path } else { &part };
-    if !at_target && metadata_if_present(path)?.is_none() {
-        return Ok(None);
-    }
-    let mut input = open_regular(path)?;
-    let metadata = input.metadata()?;
-    ensure!(
-        !at_target || metadata.len() == file.bytes,
-        "Staged file changed before verification"
-    );
+    let (path, metadata, at_target) = match saved {
+        Some(metadata) if is_regular(&metadata) && metadata.len() == file.bytes => {
+            (file.path.clone(), metadata, true)
+        }
+        _ => {
+            let part = resume::path(stage, file.index);
+            let Some(metadata) = metadata_if_present(&part)? else {
+                return Ok(None);
+            };
+            ensure!(is_regular(&metadata), "Expected a regular saved file");
+            (part, metadata, false)
+        }
+    };
     let present = metadata.len().min(file.bytes);
     let bytes = if present == file.bytes {
         present
@@ -357,31 +538,48 @@ fn saved_checkpoints(
     } else {
         resume::interval(bytes, budget)
     };
+    Ok(Some(SavedPlan {
+        path,
+        metadata,
+        at_target,
+        bytes,
+        interval,
+    }))
+}
+
+fn hash_saved(
+    plan: SavedPlan,
+    buffer: &mut [u8],
+    mut report: impl FnMut(u64, Option<&Prefix>) -> Result<()>,
+) -> Result<SavedFile> {
+    let mut input = open_regular(&plan.path)?;
+    verify_saved_file(&plan.metadata, &input)?;
     let mut hasher = digest::Context::new(&digest::SHA256);
     let mut checkpoints = Vec::new();
-    let mut offset = 0;
-    while offset < bytes {
-        let length = (bytes - offset).min(interval);
+    let mut previous = 0;
+    for offset in plan.offsets() {
         copy_hashed(
             &mut input,
             &mut io::sink(),
-            length,
+            offset - previous,
             buffer,
             &mut hasher,
-            |_| tick(),
+            |count| report(count, None),
         )?;
-        offset += length;
-        checkpoints.push(Prefix {
+        let prefix = Prefix {
             bytes: offset,
             hasher: hasher.clone(),
-        });
+        };
+        report(0, Some(&prefix))?;
+        checkpoints.push(prefix);
+        previous = offset;
     }
-    verify_saved_file(&metadata, &input)?;
-    Ok(Some(SavedFile {
+    verify_saved_file(&plan.metadata, &input)?;
+    Ok(SavedFile {
         checkpoints,
-        metadata,
-        at_target,
-    }))
+        metadata: plan.metadata,
+        at_target: plan.at_target,
+    })
 }
 
 fn receive_file(

@@ -6,10 +6,11 @@ use eframe::egui::{
     self, Align, Color32, FontFamily, FontId, Frame, Layout, RichText, Stroke, TextStyle, Ui, vec2,
 };
 use std::time::{Duration, Instant};
-use usb_direct_transfer::{CheckState, ConnectionReport};
+use usb_direct_transfer::{CheckState, ConnectionReport, PreparationProgress};
 
 const BLUE: Color32 = Color32::from_rgb(39, 85, 207);
 const CONTENT_WIDTH: f32 = 640.0;
+const PROGRESS_BAR_HEIGHT: f32 = 12.0;
 const PAIRING_HINT_DELAY: Duration = Duration::from_secs(8);
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -680,9 +681,6 @@ impl Desktop {
         };
         let cancel = ui
             .horizontal(|ui| {
-                if stopping || self.progress.is_none() {
-                    ui.spinner();
-                }
                 heading(ui, title);
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.add_enabled(
@@ -698,8 +696,14 @@ impl Desktop {
         if cancel {
             self.cancel_transfer();
         }
-        if !stopping && let Some(progress) = &self.progress {
+        if stopping {
+            activity_bar(ui, title, false);
+        } else if let Some(progress) = &self.progress {
             transfer_progress(ui, progress);
+        } else if self.receiving {
+            preparation_bar(ui, self.download_preparation, title, true);
+        } else {
+            preparation_bar(ui, self.preparation, title, !self.awaiting_approval);
         }
         ui.add_space(12.0);
     }
@@ -1300,6 +1304,87 @@ pub(super) fn item_count(count: usize) -> String {
     }
 }
 
+fn preparation_bar(
+    ui: &mut Ui,
+    preparation: Option<PreparationProgress>,
+    title: &str,
+    moving: bool,
+) {
+    let checking = match preparation {
+        Some(PreparationProgress::Checking { done, total }) => {
+            Some(("Checking files", done, total))
+        }
+        Some(PreparationProgress::CheckingSaved { done, total }) => {
+            Some(("Checking saved data", done, total))
+        }
+        _ => None,
+    };
+    if let Some((label, done, total)) = checking
+        && total > 0
+    {
+        let fraction = done as f64 / total as f64;
+        let percent = u128::from(done) * 100 / u128::from(total);
+        let duration = if done == 0 { 0.0 } else { 0.12 };
+        let painted =
+            ui.ctx()
+                .animate_value_with_time(ui.id().with(label), fraction as f32, duration);
+        progress_bar(ui, painted);
+        ui.weak(format!(
+            "{label} · {percent}% · {} of {}",
+            size(done),
+            size(total)
+        ));
+        return;
+    }
+
+    activity_bar(ui, title, moving);
+    if let Some(PreparationProgress::Scanning { files, bytes }) = preparation
+        && moving
+        && files > 0
+    {
+        let unit = if files == 1 { "file" } else { "files" };
+        ui.weak(format!("{files} {unit} found · {}", size(bytes)));
+    }
+}
+
+fn activity_bar(ui: &mut Ui, label: &str, moving: bool) {
+    let (track, response) = ui.allocate_exact_size(
+        vec2(ui.available_width(), PROGRESS_BAR_HEIGHT),
+        egui::Sense::hover(),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::ProgressIndicator, ui.is_enabled(), label)
+    });
+    if ui.is_rect_visible(track) {
+        let radius = PROGRESS_BAR_HEIGHT / 2.0;
+        ui.painter()
+            .rect_filled(track, radius, ui.visuals().faint_bg_color);
+        if moving {
+            let width = (track.width() * 0.24)
+                .max(PROGRESS_BAR_HEIGHT)
+                .min(track.width());
+            let time = ui.input(|input| input.time);
+            let position = (0.5 - (time * std::f64::consts::PI).cos() * 0.5) as f32;
+            let start = track.min + vec2((track.width() - width) * position, 0.0);
+            let segment = egui::Rect::from_min_size(start, vec2(width, track.height()));
+            ui.painter().rect_filled(segment, radius, BLUE);
+            ui.ctx().request_repaint();
+        }
+    }
+}
+
+fn progress_bar(ui: &mut Ui, fraction: f32) {
+    ui.scope(|ui| {
+        ui.visuals_mut().extreme_bg_color = ui.visuals().faint_bg_color;
+        ui.add(
+            egui::ProgressBar::new(fraction)
+                .desired_width(ui.available_width())
+                .desired_height(PROGRESS_BAR_HEIGHT)
+                .fill(BLUE),
+        );
+    });
+}
+
 fn transfer_progress(ui: &mut Ui, progress: &Progress) {
     let remaining = progress.total.saturating_sub(progress.done);
     let fraction = if remaining == 0 {
@@ -1327,18 +1412,11 @@ fn transfer_progress(ui: &mut Ui, progress: &Progress) {
     } else {
         "Estimating time remaining…".into()
     };
-    ui.strong(format!("{percent}% · {time}"));
     let painted_fraction =
         ui.ctx()
             .animate_value_with_time(ui.id().with(progress.started), fraction, 0.12);
-    ui.scope(|ui| {
-        ui.visuals_mut().extreme_bg_color = ui.visuals().faint_bg_color;
-        ui.add(
-            egui::ProgressBar::new(painted_fraction)
-                .desired_height(12.0)
-                .fill(BLUE),
-        );
-    });
+    progress_bar(ui, painted_fraction);
+    ui.strong(format!("{percent}% · {time}"));
     let mut bytes = format!("{} of {}", size(progress.done), size(progress.total));
     if let Some(rate) = rate {
         bytes.push_str(&format!(" · {}/s", size(rate as u64)));

@@ -16,12 +16,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
-use transfer::{Destination, Manifest, OfferPreview, Prepared, Summary};
+use transfer::{Destination, Manifest, OfferPreview, Prepared, ResumeVerification, Summary};
 
 const PROTOCOL: &[u8] = b"usb-direct-transfer/1";
 const PREVIEW_PROTOCOL: &[u8] = b"usb-direct-transfer/2";
 // Peers on version 3 can still pair through the prehashed version 2 protocol.
 const STREAM_PROTOCOL: &[u8] = b"usb-direct-transfer/4";
+const PARALLEL_RESUME_PROTOCOL: &[u8] = b"usb-direct-transfer/5";
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 const MIN_PREVIEW_BYTES: u64 = 32 * 1024 * 1024;
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -37,6 +38,13 @@ pub enum Command {
     Disconnect,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum PreparationProgress {
+    Scanning { files: usize, bytes: u64 },
+    Checking { done: u64, total: u64 },
+    CheckingSaved { done: u64, total: u64 },
+}
+
 #[derive(Debug)]
 pub enum Event {
     Status(String),
@@ -50,6 +58,10 @@ pub enum Event {
     },
     IncomingClosed {
         accepted: bool,
+    },
+    Preparing {
+        receiving: bool,
+        progress: PreparationProgress,
     },
     Progress {
         receiving: bool,
@@ -118,7 +130,7 @@ pub fn start(options: network::Options, destination: PathBuf) -> Session {
     start_with_notify(options, destination, || {})
 }
 
-/// Calls `notify` on the worker thread after each event is queued.
+/// Calls `notify` from a worker thread after each event is queued.
 pub fn start_with_notify(
     options: network::Options,
     destination: PathBuf,
@@ -128,7 +140,7 @@ pub fn start_with_notify(
     let (send, events) = mpsc::channel();
     let updates = Updates {
         send,
-        notify: Box::new(notify),
+        notify: Arc::new(Mutex::new(notify)),
     };
     let control = Arc::new(ConnectionControl::default());
     let worker_control = Arc::clone(&control);
@@ -170,14 +182,15 @@ pub fn start_with_notify(
     }
 }
 
+#[derive(Clone)]
 struct Updates {
     send: mpsc::Sender<Event>,
-    notify: Box<dyn Fn() + Send>,
+    notify: Arc<Mutex<dyn Fn() + Send>>,
 }
 
 fn emit(updates: &Updates, event: Event) {
     if updates.send.send(event).is_ok() {
-        (updates.notify)();
+        (updates.notify.lock().unwrap())();
     }
 }
 
@@ -230,6 +243,13 @@ enum Protocol {
     Legacy,
     Preview,
     Streaming,
+    ParallelResume,
+}
+
+impl Protocol {
+    fn streaming(self) -> bool {
+        matches!(self, Self::Streaming | Self::ParallelResume)
+    }
 }
 
 fn secure(mut tcp: TcpStream, client: bool) -> Result<(Box<dyn Io>, String, Protocol)> {
@@ -239,6 +259,7 @@ fn secure(mut tcp: TcpStream, client: bool) -> Result<(Box<dyn Io>, String, Prot
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let label = b"EXPORTER-Channel-Binding";
     let versions = vec![
+        PARALLEL_RESUME_PROTOCOL.to_vec(),
         STREAM_PROTOCOL.to_vec(),
         PREVIEW_PROTOCOL.to_vec(),
         PROTOCOL.to_vec(),
@@ -284,6 +305,7 @@ fn secure(mut tcp: TcpStream, client: bool) -> Result<(Box<dyn Io>, String, Prot
 
 fn negotiated_protocol(protocol: Option<&[u8]>) -> Result<Protocol> {
     match protocol {
+        Some(PARALLEL_RESUME_PROTOCOL) => Ok(Protocol::ParallelResume),
         Some(STREAM_PROTOCOL) => Ok(Protocol::Streaming),
         Some(PREVIEW_PROTOCOL) => Ok(Protocol::Preview),
         Some(PROTOCOL) => Ok(Protocol::Legacy),
@@ -482,7 +504,56 @@ fn progress(updates: &Updates, receiving: bool) -> impl FnMut(u64, u64) + '_ {
     }
 }
 
-fn outgoing(stream: &mut impl Io, offer: OutgoingOffer, updates: &Updates) -> Result<()> {
+fn preparation_progress(
+    updates: &Updates,
+    receiving: bool,
+) -> impl FnMut(PreparationProgress) + Send + '_ {
+    let mut last = None;
+    move |progress| {
+        use std::mem::discriminant;
+
+        let now = Instant::now();
+        let milestone = matches!(progress, PreparationProgress::Scanning { files: 1, .. })
+            || matches!(
+                progress,
+                PreparationProgress::Checking { done, total }
+                | PreparationProgress::CheckingSaved { done, total } if done == total
+            );
+        if milestone
+            || last.is_none_or(|(at, previous)| {
+                discriminant(&previous) != discriminant(&progress) || now - at >= POLL_INTERVAL
+            })
+        {
+            emit(
+                updates,
+                Event::Preparing {
+                    receiving,
+                    progress,
+                },
+            );
+            last = Some((now, progress));
+        }
+    }
+}
+
+fn resume_verification(
+    updates: &Updates,
+    protocol: Protocol,
+    receiving: bool,
+) -> ResumeVerification<impl FnMut(u64, u64) + Send + '_> {
+    let mut report = preparation_progress(updates, receiving);
+    ResumeVerification {
+        parallel: protocol == Protocol::ParallelResume,
+        checked: move |done, total| report(PreparationProgress::CheckingSaved { done, total }),
+    }
+}
+
+fn outgoing(
+    stream: &mut impl Io,
+    offer: OutgoingOffer,
+    updates: &Updates,
+    protocol: Protocol,
+) -> Result<()> {
     let (frame, mut ready, preparation) = match offer {
         OutgoingOffer::Ready(mut offer) => (std::mem::take(&mut offer.frame), Some(offer), None),
         OutgoingOffer::Preview { frame, preparation } => (frame, None, Some(preparation)),
@@ -545,7 +616,7 @@ fn outgoing(stream: &mut impl Io, offer: OutgoingOffer, updates: &Updates) -> Re
     }
     drop(frame);
     let batch = if prehashed {
-        let preparation = prepare_legacy_retry(batch);
+        let preparation = prepare_legacy_retry(batch, updates);
         let Some(PreparedOffer { batch, frame }) =
             wait_for_preparation(stream, updates, &preparation)?
         else {
@@ -557,7 +628,13 @@ fn outgoing(stream: &mut impl Io, offer: OutgoingOffer, updates: &Updates) -> Re
     } else {
         batch
     };
-    transfer::send(stream, &batch, progress(updates, false)).context("Sending files failed")?;
+    transfer::send(
+        stream,
+        &batch,
+        resume_verification(updates, protocol, false),
+        progress(updates, false),
+    )
+    .context("Sending files failed")?;
     stream.flush()?;
     let Frame::Receipt(mut summary) = read_frame(stream)? else {
         bail!("Missing transfer receipt");
@@ -593,13 +670,17 @@ fn wait_for_preparation(
     }
 }
 
-fn prepare_legacy_retry(mut batch: Prepared) -> PendingOffer {
+fn prepare_legacy_retry(mut batch: Prepared, updates: &Updates) -> PendingOffer {
     let (complete, ready) = mpsc::channel();
     let cancelled = Arc::new(AtomicBool::new(false));
     let worker_cancelled = Arc::clone(&cancelled);
+    let updates = updates.clone();
     thread::spawn(move || {
+        let mut report = preparation_progress(&updates, false);
         let result = batch
-            .finish_hashes(&worker_cancelled)
+            .finish_hashes(&worker_cancelled, |done, total| {
+                report(PreparationProgress::Checking { done, total });
+            })
             .and_then(|()| PreparedOffer::encode(batch));
         let _ = complete.send(result);
     });
@@ -711,8 +792,15 @@ fn incoming(
             manifest
         }
     };
-    let summary = transfer::receive(stream, &manifest, &to, cancelled, progress(updates, true))
-        .context("Receiving files failed")?;
+    let summary = transfer::receive(
+        stream,
+        &manifest,
+        &to,
+        cancelled,
+        resume_verification(updates, preparation.protocol, true),
+        progress(updates, true),
+    )
+    .context("Receiving files failed")?;
     let receipt = (|| {
         write_receipt(stream, &summary)?;
         let Frame::ReceiptConfirmed = read_frame(stream)? else {
@@ -814,15 +902,21 @@ impl Preparation {
         self.cancelled = Arc::new(AtomicBool::new(false));
         let cancelled = Arc::clone(&self.cancelled);
         let protocol = self.protocol;
+        self.pending = Some(prepared);
+        emit(updates, Event::Status("Preparing files…".into()));
+        let updates = updates.clone();
         thread::spawn(move || {
+            let mut report = preparation_progress(&updates, false);
             let mut deferred = None;
             let offer = (|| {
-                let (mut batch, bytes) = transfer::scan_batch(&paths, &cancelled)?;
-                if protocol == Protocol::Streaming && bytes >= MIN_PREVIEW_BYTES {
+                let mut batch = transfer::scan_batch(&paths, &cancelled, |files, bytes| {
+                    report(PreparationProgress::Scanning { files, bytes });
+                })?;
+                if protocol.streaming() && batch.bytes >= MIN_PREVIEW_BYTES {
                     batch.enable_streaming(&paths)?;
                 } else {
-                    if protocol == Protocol::Preview && bytes >= MIN_PREVIEW_BYTES {
-                        let preview = batch.preview(bytes);
+                    if protocol == Protocol::Preview && batch.bytes >= MIN_PREVIEW_BYTES {
+                        let preview = batch.preview();
                         let frame = encode_frame(Frame::<Manifest>::Preview(preview))?;
                         let (complete, result) = mpsc::channel();
                         let preparation = PendingOffer {
@@ -834,7 +928,9 @@ impl Preparation {
                             .map_err(|_| anyhow::anyhow!("Transfer preparation canceled"))?;
                         deferred = Some(complete);
                     }
-                    batch.finish_hashes(&cancelled)?;
+                    batch.finish_hashes(&cancelled, |done, total| {
+                        report(PreparationProgress::Checking { done, total });
+                    })?;
                 }
                 PreparedOffer::encode(batch)
             })();
@@ -844,8 +940,6 @@ impl Preparation {
                 let _ = ready.send(offer.map(OutgoingOffer::Ready));
             }
         });
-        self.pending = Some(prepared);
-        emit(updates, Event::Status("Preparing files…".into()));
     }
 
     fn take_ready(&mut self, deadline: Instant) -> Option<Result<OutgoingOffer>> {
@@ -900,7 +994,7 @@ fn run(
         if offer_turn {
             if let Some(result) = preparation.take_ready(deadline) {
                 match result {
-                    Ok(batch) => outgoing(&mut stream, batch, updates)?,
+                    Ok(batch) => outgoing(&mut stream, batch, updates, protocol)?,
                     Err(error) => {
                         emit(updates, Event::Error(format!("{error:#}")));
                         write_frame(&mut stream, Frame::Idle)?;
@@ -911,9 +1005,7 @@ fn run(
             }
         } else {
             let offer = match read_frame(&mut stream)? {
-                Frame::Offer(manifest)
-                    if !manifest.is_streaming() || protocol == Protocol::Streaming =>
-                {
+                Frame::Offer(manifest) if !manifest.is_streaming() || protocol.streaming() => {
                     Some(IncomingOffer::Ready(manifest))
                 }
                 Frame::Preview(preview) if protocol != Protocol::Legacy => {
@@ -954,9 +1046,9 @@ mod tests {
         let (notified, observed) = mpsc::channel();
         let updates = Updates {
             send,
-            notify: Box::new(move || {
+            notify: Arc::new(Mutex::new(move || {
                 notified.send(events.try_recv().unwrap()).unwrap();
-            }),
+            })),
         };
         emit(&updates, Event::Paired);
         assert!(matches!(observed.try_recv(), Ok(Event::Paired)));
@@ -1003,7 +1095,7 @@ mod tests {
         let (send, events) = mpsc::channel();
         let updates = Updates {
             send,
-            notify: Box::new(|| {}),
+            notify: Arc::new(Mutex::new(|| {})),
         };
         let worker_socket = socket.try_clone().unwrap();
         thread::spawn(move || {
@@ -1066,6 +1158,50 @@ mod tests {
     }
 
     #[test]
+    fn reports_files_found_and_hash_progress_before_copying() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("example.bin");
+        let bytes = 2 * 1024 * 1024;
+        fs::File::create(&source)?.set_len(bytes)?;
+        let (left, right) = connected(temp.path());
+        pair(&left, &right);
+
+        left.commands.send(Command::Send(vec![source]))?;
+        let found = left.next(|event| match event {
+            Event::Preparing {
+                receiving: false,
+                progress: PreparationProgress::Scanning { files: 1, bytes },
+            } => Some(bytes),
+            _ => None,
+        });
+        assert_eq!(found, bytes);
+        for expected in [0, bytes] {
+            let sample = left.next(|event| match event {
+                Event::Preparing {
+                    receiving: false,
+                    progress: PreparationProgress::Checking { done, total },
+                } if done == expected => Some(total),
+                Event::AwaitingApproval(true) => panic!("Missing preparation progress"),
+                _ => None,
+            });
+            assert_eq!(sample, bytes);
+        }
+        left.next(|event| matches!(event, Event::AwaitingApproval(true)).then_some(()));
+        right.approve_batch();
+        right.next(|event| {
+            matches!(
+                event,
+                Event::Completed {
+                    receiving: true,
+                    ..
+                }
+            )
+            .then_some(())
+        });
+        Ok(())
+    }
+
+    #[test]
     fn declining_an_early_offer_cancels_pending_preparation() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let source = temp.path().join("archive.bin");
@@ -1088,7 +1224,7 @@ mod tests {
         let (send, _events) = mpsc::channel();
         let updates = Updates {
             send,
-            notify: Box::new(|| {}),
+            notify: Arc::new(Mutex::new(|| {})),
         };
         thread::scope(|scope| -> Result<()> {
             let outgoing = scope.spawn(move || {
@@ -1096,6 +1232,7 @@ mod tests {
                     &mut sender,
                     OutgoingOffer::Preview { frame, preparation },
                     &updates,
+                    Protocol::Preview,
                 )
             });
             assert!(matches!(read_frame(&mut receiver)?, Frame::Preview(_)));
@@ -1252,17 +1389,24 @@ mod tests {
         control.attach(&receiver)?;
         thread::scope(|scope| -> Result<()> {
             scope.spawn(|| {
-                let result = secure(sender, true)
-                    .and_then(|(mut stream, _, _)| transfer::send(&mut stream, batch, |_, _| {}));
+                let result = secure(sender, true).and_then(|(mut stream, _, protocol)| {
+                    transfer::send(
+                        &mut stream,
+                        batch,
+                        ResumeVerification::silent(protocol == Protocol::ParallelResume),
+                        |_, _| {},
+                    )
+                });
                 let _ = finished.send(result);
             });
-            let (mut stream, _, _) = secure(receiver, false)?;
+            let (mut stream, _, protocol) = secure(receiver, false)?;
             let destination = Destination::open(output)?;
             let received = transfer::receive(
                 &mut stream,
                 &batch.manifest,
                 &destination,
                 &control.cancelled,
+                ResumeVerification::silent(protocol == Protocol::ParallelResume),
                 |done, total| {
                     if cancel_at(done, total) {
                         control.close(true);
@@ -1324,7 +1468,7 @@ mod tests {
         let paths = std::slice::from_ref(&folder);
         let cancelled = AtomicBool::new(false);
         let batch = if streaming {
-            let (mut batch, _) = transfer::scan_batch(paths, &cancelled)?;
+            let mut batch = transfer::scan_batch(paths, &cancelled, |_, _| {})?;
             batch.enable_streaming(paths)?;
             batch
         } else {
@@ -1355,6 +1499,22 @@ mod tests {
         pair(&left, &right);
         left.commands.send(Command::Send(vec![folder]))?;
         right.approve_batch();
+        let checked = if streaming {
+            right.next(|event| match event {
+                Event::Preparing {
+                    receiving: true,
+                    progress: PreparationProgress::CheckingSaved { done, total },
+                } if done == total => Some(done),
+                Event::Progress {
+                    receiving: true, ..
+                } => {
+                    panic!("Missing saved-data verification progress");
+                }
+                _ => None,
+            })
+        } else {
+            0
+        };
         let reused = right.next(|event| match event {
             Event::Progress {
                 receiving: true,
@@ -1372,6 +1532,17 @@ mod tests {
                     checkpoint
                 }
         );
+        if streaming {
+            assert_eq!(
+                checked,
+                first.len() as u64
+                    + if damaged_prefix {
+                        3 * checkpoint
+                    } else {
+                        checkpoint
+                    },
+            );
+        }
         right.next(|event| {
             matches!(
                 event,

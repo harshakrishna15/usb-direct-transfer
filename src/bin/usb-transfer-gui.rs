@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use indexmap::IndexSet;
 use usb_direct_transfer::{
-    Command, ConnectionMonitor, ConnectionReport, Event, Options, Pending, Session, Summary,
-    discard, pending, probe_peer, start_with_notify,
+    Command, ConnectionMonitor, ConnectionReport, Event, Options, Pending, PreparationProgress,
+    Session, Summary, discard, pending, probe_peer, start_with_notify,
 };
 
 #[path = "usb-transfer-gui/picker.rs"]
@@ -201,6 +201,8 @@ struct Desktop {
     sending: bool,
     awaiting_approval: bool,
     receiving: bool,
+    preparation: Option<PreparationProgress>,
+    download_preparation: Option<PreparationProgress>,
     progress: Option<Progress>,
     result: Option<TransferResult>,
     saved: Vec<Pending>,
@@ -244,6 +246,8 @@ impl Desktop {
             sending: false,
             awaiting_approval: false,
             receiving: false,
+            preparation: None,
+            download_preparation: None,
             progress: None,
             result: None,
             saved: Vec::new(),
@@ -414,6 +418,9 @@ impl Desktop {
         self.incoming = None;
         self.sending = false;
         self.receiving = false;
+        self.awaiting_approval = false;
+        self.preparation = None;
+        self.download_preparation = None;
         self.progress = None;
         self.refresh_pending(ctx);
     }
@@ -450,6 +457,7 @@ impl Desktop {
             self.result = None;
             self.sending = true;
             self.awaiting_approval = false;
+            self.preparation = None;
             true
         } else {
             false
@@ -520,6 +528,17 @@ impl Desktop {
                 Event::IncomingClosed { accepted } => {
                     self.incoming = None;
                     self.receiving = accepted;
+                    self.download_preparation = None;
+                }
+                Event::Preparing {
+                    receiving,
+                    progress,
+                } => {
+                    if receiving && self.receiving {
+                        self.download_preparation = Some(progress);
+                    } else if !receiving && self.sending {
+                        self.preparation = Some(progress);
+                    }
                 }
                 Event::Progress {
                     receiving,
@@ -548,8 +567,10 @@ impl Desktop {
                     self.progress = None;
                     if receiving {
                         self.receiving = false;
+                        self.download_preparation = None;
                     } else {
                         self.sending = false;
+                        self.preparation = None;
                         self.last_sent.clear();
                     }
                     if receiving {
@@ -560,8 +581,10 @@ impl Desktop {
                     self.error = Some(error);
                     if self.incoming.is_none() {
                         self.sending = false;
+                        self.preparation = None;
                     }
                     self.receiving = false;
+                    self.download_preparation = None;
                     self.progress = None;
                 }
                 Event::Disconnected => self.disconnect(ctx),
