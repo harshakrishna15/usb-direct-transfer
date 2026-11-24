@@ -1844,9 +1844,28 @@ fn copy_hashed(
 fn copy_payload(
     source: &mut impl Read,
     destination: &mut impl Write,
+    bytes: u64,
+    buffer: &mut [u8],
+    hasher: &mut digest::Context,
+    copied: impl FnMut(u64) -> Result<()>,
+) -> Result<()> {
+    copy_and_hash_payload(
+        bytes,
+        buffer,
+        hasher,
+        |chunk| {
+            source.read_exact(chunk)?;
+            destination.write_all(chunk)
+        },
+        copied,
+    )
+}
+
+fn copy_and_hash_payload(
     mut bytes: u64,
     buffer: &mut [u8],
     hasher: &mut digest::Context,
+    mut transfer_chunk: impl FnMut(&mut [u8]) -> io::Result<()>,
     mut copied: impl FnMut(u64) -> Result<()>,
 ) -> Result<()> {
     use std::{sync::mpsc, thread};
@@ -1854,7 +1873,15 @@ fn copy_payload(
     if bytes < PARALLEL_CHECKSUM_MIN_BYTES
         || !thread::available_parallelism().is_ok_and(|cores| cores.get() > 1)
     {
-        return copy_hashed(source, destination, bytes, buffer, hasher, copied);
+        while bytes > 0 {
+            let count = bytes.min(buffer.len() as u64) as usize;
+            let chunk = &mut buffer[..count];
+            transfer_chunk(chunk)?;
+            hasher.update(chunk);
+            bytes -= count as u64;
+            copied(count as u64)?;
+        }
+        return Ok(());
     }
 
     // Hash each filled buffer in order while the transfer uses the other one.
@@ -1879,9 +1906,7 @@ fn copy_payload(
             while bytes > 0 {
                 let buffer = available.recv().context("Checksum worker stopped")?;
                 let count = bytes.min(buffer.len() as u64) as usize;
-                let chunk = &mut buffer[..count];
-                source.read_exact(chunk)?;
-                destination.write_all(chunk)?;
+                transfer_chunk(&mut buffer[..count])?;
                 submit
                     .send((buffer, count))
                     .map_err(|_| anyhow::anyhow!("Checksum worker stopped"))?;

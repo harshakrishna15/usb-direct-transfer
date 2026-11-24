@@ -1,8 +1,8 @@
 use super::{
-    CHUNK, FileIdentity, Kind, Modified, PUBLISHED, Prepared, ReadWrite, Source, StagedFile,
-    copy_hashed, copy_payload, display_path, is_regular, metadata_if_present, open_regular,
-    preparation_pulse, preparing_pulse, read_integer, read_prepared, resume, staging_batch,
-    sync_directory, write_integer,
+    CHUNK, Entry, FileIdentity, Kind, Modified, PUBLISHED, Prepared, ReadWrite, Source, StagedFile,
+    copy_and_hash_payload, copy_hashed, copy_payload, display_path, is_regular,
+    metadata_if_present, open_regular, preparation_pulse, preparing_pulse, read_integer,
+    read_prepared, resume, staging_batch, sync_directory, write_integer,
 };
 use anyhow::{Context, Result, ensure};
 use ring::digest;
@@ -13,11 +13,52 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-// The receiver offers hashes of saved prefixes. The sender replies with the
-// indices it verified, then sends the remaining file bytes and each file hash.
+// The receiver offers checkpoint hashes. The sender replies with the longest
+// verified prefix for each file, then sends remaining bytes and file hashes.
 struct Prefix {
     bytes: u64,
     hasher: digest::Context,
+}
+
+struct ProposedFile {
+    index: usize,
+    checkpoints: Vec<(u64, [u8; 32])>,
+}
+
+fn read_proposals(stream: &mut impl Read, entries: &[&Entry]) -> Result<Vec<ProposedFile>> {
+    let count = read_prepared(stream)?;
+    ensure!(count <= entries.len(), "Invalid saved prefix count");
+    let mut offered: Vec<ProposedFile> = Vec::with_capacity(count);
+    let mut budget = resume::MAX_CHECKPOINTS;
+    for _ in 0..count {
+        let index = read_integer(stream)?;
+        ensure!(
+            offered.last().is_none_or(|previous| previous.index < index),
+            "Invalid saved file order"
+        );
+        let Some(Kind::File { bytes, .. }) = entries.get(index).map(|entry| &entry.kind) else {
+            anyhow::bail!("Unknown file in resume request");
+        };
+        let count = read_integer(stream)?;
+        ensure!(
+            count > 0 && count - 1 <= budget,
+            "Invalid saved checkpoint count"
+        );
+        budget -= count - 1;
+        let mut checkpoints = Vec::with_capacity(count);
+        let mut previous = 0;
+        for _ in 0..count {
+            let offset = u64::from_be_bytes(read_array(stream)?);
+            ensure!(
+                (previous < offset) && offset <= *bytes,
+                "Invalid saved file length"
+            );
+            checkpoints.push((offset, read_array::<32>(stream)?));
+            previous = offset;
+        }
+        offered.push(ProposedFile { index, checkpoints });
+    }
+    Ok(offered)
 }
 
 pub(super) fn send(
@@ -27,30 +68,12 @@ pub(super) fn send(
     mut progress: impl FnMut(u64, u64),
 ) -> Result<()> {
     let entries: Vec<_> = batch.manifest.entries().collect();
-    let count = read_prepared(stream)?;
-    ensure!(count <= entries.len(), "Invalid saved prefix count");
-    let mut offered = Vec::with_capacity(count);
-    for _ in 0..count {
-        let index = read_integer(stream)?;
-        ensure!(
-            offered
-                .last()
-                .is_none_or(|(previous, _, _)| *previous < index),
-            "Invalid saved file order"
-        );
-        let Some(Kind::File { bytes, .. }) = entries.get(index).map(|entry| &entry.kind) else {
-            anyhow::bail!("Unknown file in resume request");
-        };
-        let offset = u64::from_be_bytes(read_array(stream)?);
-        ensure!((1..=*bytes).contains(&offset), "Invalid saved file length");
-        let expected = read_array::<32>(stream)?;
-        offered.push((index, offset, expected));
-    }
+    let offered = read_proposals(stream, &entries)?;
 
     let mut accepted = BTreeMap::new();
     let mut buffer = vec![0; CHUNK];
     let mut next_pulse = Instant::now() + Duration::from_secs(1);
-    for (index, offset, expected) in offered {
+    for ProposedFile { index, checkpoints } in offered {
         let source = batch.sources[index]
             .as_ref()
             .context("Missing source file")?;
@@ -61,36 +84,44 @@ pub(super) fn send(
         let mut file = open_regular(&source.path)?;
         check_source(&file, source, bytes, entry.modified)?;
         let mut hasher = digest::Context::new(&digest::SHA256);
-        copy_hashed(
-            &mut file,
-            &mut io::sink(),
-            offset,
-            &mut buffer,
-            &mut hasher,
-            |_| preparation_pulse(stream, &mut next_pulse),
-        )?;
+        let mut previous = 0;
+        let mut verified = None;
+        for (offset, expected) in checkpoints {
+            copy_hashed(
+                &mut file,
+                &mut io::sink(),
+                offset - previous,
+                &mut buffer,
+                &mut hasher,
+                |_| preparation_pulse(stream, &mut next_pulse),
+            )?;
+            if hasher.clone().finish().as_ref() != expected {
+                break;
+            }
+            previous = offset;
+            verified = Some(Prefix {
+                bytes: offset,
+                hasher: hasher.clone(),
+            });
+        }
         check_source(&file, source, bytes, entry.modified)?;
-        if hasher.clone().finish().as_ref() == expected {
-            accepted.insert(
-                index,
-                Prefix {
-                    bytes: offset,
-                    hasher,
-                },
-            );
+        if let Some(prefix) = verified {
+            accepted.insert(index, prefix);
         }
     }
     {
         let mut writer = io::BufWriter::new(&mut *stream);
         write_integer(&mut writer, accepted.len())?;
-        for &index in accepted.keys() {
+        for (&index, prefix) in &accepted {
             write_integer(&mut writer, index)?;
+            writer.write_all(&prefix.bytes.to_be_bytes())?;
         }
         writer.flush()?;
     }
 
     let mut complete = accepted.values().map(|prefix| prefix.bytes).sum();
     progress(complete, total);
+    let mut payload = vec![0; CHUNK];
     for (index, entry) in entries.into_iter().enumerate() {
         let Kind::File { bytes, .. } = entry.kind else {
             continue;
@@ -110,18 +141,18 @@ pub(super) fn send(
         } else {
             (0, digest::Context::new(&digest::SHA256))
         };
-        copy_payload(
-            &mut file,
-            stream,
+        copy_and_hash_payload(
             bytes - offset,
             &mut buffer,
             &mut hasher,
+            |reference| send_verified_chunk(&mut file, stream, reference, &mut payload),
             |count| {
                 complete += count;
                 progress(complete, total);
                 Ok(())
             },
-        )?;
+        )
+        .with_context(|| format!("Cannot copy {}", display_path(&source.path)))?;
         check_source(&file, source, bytes, entry.modified)?;
         stream.write_all(hasher.finish().as_ref())?;
     }
@@ -131,6 +162,27 @@ pub(super) fn send(
         "Missing publication confirmation"
     );
     Ok(())
+}
+
+fn send_verified_chunk(
+    source: &mut (impl Read + Seek),
+    stream: &mut impl Write,
+    reference: &mut [u8],
+    payload: &mut [u8],
+) -> io::Result<()> {
+    // Keep the reference bytes for the file hash and send the second read.
+    source.read_exact(reference)?;
+    // Read this range again while it is still likely to be in the page cache.
+    source.seek_relative(-(reference.len() as i64))?;
+    let payload = &mut payload[..reference.len()];
+    source.read_exact(payload)?;
+    if payload != reference {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Source changed between reads",
+        ));
+    }
+    stream.write_all(payload)
 }
 
 fn check_source(file: &File, source: &Source, bytes: u64, modified: Modified) -> Result<()> {
@@ -151,17 +203,21 @@ struct SavedPrefix {
     at_target: bool,
 }
 
-impl SavedPrefix {
-    fn verify_file(&self, file: &File) -> Result<()> {
-        let metadata = file.metadata()?;
-        ensure!(
-            metadata.len() == self.metadata.len()
-                && Modified::from(&metadata) == Modified::from(&self.metadata)
-                && FileIdentity::from(&metadata) == FileIdentity::from(&self.metadata),
-            "Staged data changed during verification"
-        );
-        Ok(())
-    }
+struct SavedFile {
+    checkpoints: Vec<Prefix>,
+    metadata: Metadata,
+    at_target: bool,
+}
+
+fn verify_saved_file(before: &Metadata, file: &File) -> Result<()> {
+    let after = file.metadata()?;
+    ensure!(
+        after.len() == before.len()
+            && Modified::from(&after) == Modified::from(before)
+            && FileIdentity::from(&after) == FileIdentity::from(before),
+        "Staged data changed during verification"
+    );
+    Ok(())
 }
 
 pub(super) fn receive(
@@ -176,10 +232,12 @@ pub(super) fn receive(
     let mut buffer = vec![0; CHUNK];
     let mut next_pulse = Instant::now() + Duration::from_secs(1);
     let mut tick = || preparing_pulse(stream, &mut next_pulse, cancelled);
+    let mut budget = resume::MAX_CHECKPOINTS;
     for file in &files {
         tick()?;
-        if let Some(prefix) = saved_prefix(stage, file, &mut buffer, &mut tick)? {
-            offered.insert(file.index, prefix);
+        if let Some(saved) = saved_checkpoints(stage, file, budget, &mut buffer, &mut tick)? {
+            budget -= saved.checkpoints.len() - 1;
+            offered.insert(file.index, saved);
         }
     }
     {
@@ -187,8 +245,11 @@ pub(super) fn receive(
         write_integer(&mut writer, offered.len())?;
         for (&index, saved) in &offered {
             write_integer(&mut writer, index)?;
-            writer.write_all(&saved.prefix.bytes.to_be_bytes())?;
-            writer.write_all(saved.prefix.hasher.clone().finish().as_ref())?;
+            write_integer(&mut writer, saved.checkpoints.len())?;
+            for checkpoint in &saved.checkpoints {
+                writer.write_all(&checkpoint.bytes.to_be_bytes())?;
+                writer.write_all(checkpoint.hasher.clone().finish().as_ref())?;
+            }
         }
         writer.flush()?;
     }
@@ -197,10 +258,23 @@ pub(super) fn receive(
     let mut accepted = BTreeMap::new();
     for _ in 0..count {
         let index = read_integer(stream)?;
-        let prefix = offered
+        let bytes = u64::from_be_bytes(read_array(stream)?);
+        let saved = offered
             .remove(&index)
             .context("Unexpected saved file index")?;
-        accepted.insert(index, prefix);
+        let prefix = saved
+            .checkpoints
+            .into_iter()
+            .find(|checkpoint| checkpoint.bytes == bytes)
+            .context("Unexpected saved checkpoint")?;
+        accepted.insert(
+            index,
+            SavedPrefix {
+                prefix,
+                metadata: saved.metadata,
+                at_target: saved.at_target,
+            },
+        );
     }
     for file in &files {
         ensure!(
@@ -236,12 +310,13 @@ pub(super) fn receive(
     received.and(small_files.flush(stage))
 }
 
-fn saved_prefix(
+fn saved_checkpoints(
     stage: &Path,
     file: &StagedFile<'_>,
+    budget: usize,
     buffer: &mut [u8],
     mut tick: impl FnMut() -> Result<()>,
-) -> Result<Option<SavedPrefix>> {
+) -> Result<Option<SavedFile>> {
     let saved = metadata_if_present(&file.path)?;
     if !file.is_staged {
         ensure!(
@@ -277,22 +352,36 @@ fn saved_prefix(
     if bytes == 0 {
         return Ok(None);
     }
+    let interval = if at_target {
+        bytes
+    } else {
+        resume::interval(bytes, budget)
+    };
     let mut hasher = digest::Context::new(&digest::SHA256);
-    copy_hashed(
-        &mut input,
-        &mut io::sink(),
-        bytes,
-        buffer,
-        &mut hasher,
-        |_| tick(),
-    )?;
-    let saved = SavedPrefix {
-        prefix: Prefix { bytes, hasher },
+    let mut checkpoints = Vec::new();
+    let mut offset = 0;
+    while offset < bytes {
+        let length = (bytes - offset).min(interval);
+        copy_hashed(
+            &mut input,
+            &mut io::sink(),
+            length,
+            buffer,
+            &mut hasher,
+            |_| tick(),
+        )?;
+        offset += length;
+        checkpoints.push(Prefix {
+            bytes: offset,
+            hasher: hasher.clone(),
+        });
+    }
+    verify_saved_file(&metadata, &input)?;
+    Ok(Some(SavedFile {
+        checkpoints,
         metadata,
         at_target,
-    };
-    saved.verify_file(&input)?;
-    Ok(Some(saved))
+    }))
 }
 
 fn receive_file(
@@ -315,7 +404,7 @@ fn receive_file(
     };
     let saved = match saved {
         Some(saved) if saved.at_target => {
-            return saved.verify_file(&open_regular(&file.path)?);
+            return verify_saved_file(&saved.metadata, &open_regular(&file.path)?);
         }
         other => other,
     };
@@ -346,7 +435,7 @@ fn receive_file(
     let part = resume::path(stage, file.index);
     let mut output = resume::open(&part)?;
     let (offset, mut hasher) = if let Some(saved) = saved {
-        saved.verify_file(&output)?;
+        verify_saved_file(&saved.metadata, &output)?;
         (saved.prefix.bytes, saved.prefix.hasher)
     } else {
         (0, empty_hash())
@@ -374,4 +463,47 @@ fn read_array<const N: usize>(stream: &mut impl Read) -> io::Result<[u8; N]> {
     let mut value = [0; N];
     stream.read_exact(&mut value)?;
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    struct ChangedOnRewind(Cursor<Vec<u8>>);
+
+    impl Read for ChangedOnRewind {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.0.read(buffer)
+        }
+    }
+
+    impl Seek for ChangedOnRewind {
+        fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+            if matches!(position, SeekFrom::Current(offset) if offset < 0) {
+                self.0.get_mut()[0] ^= 1;
+            }
+            self.0.seek(position)
+        }
+    }
+
+    #[test]
+    fn changing_bytes_between_reads_are_never_sent() {
+        let mut reference = [0; 4];
+        let mut payload = [0; 4];
+        let mut copied = Vec::new();
+        let mut input = ChangedOnRewind(Cursor::new(b"data".to_vec()));
+        let result = copy_and_hash_payload(
+            4,
+            &mut reference,
+            &mut digest::Context::new(&digest::SHA256),
+            |reference| send_verified_chunk(&mut input, &mut copied, reference, &mut payload),
+            |_| Ok(()),
+        );
+        assert!(
+            result
+                .is_err_and(|error| { error.to_string().contains("Source changed between reads") })
+        );
+        assert!(copied.is_empty());
+    }
 }

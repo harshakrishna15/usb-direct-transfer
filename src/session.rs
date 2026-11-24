@@ -20,7 +20,8 @@ use transfer::{Destination, Manifest, OfferPreview, Prepared, Summary};
 
 const PROTOCOL: &[u8] = b"usb-direct-transfer/1";
 const PREVIEW_PROTOCOL: &[u8] = b"usb-direct-transfer/2";
-const STREAM_PROTOCOL: &[u8] = b"usb-direct-transfer/3";
+// Peers on version 3 can still pair through the prehashed version 2 protocol.
+const STREAM_PROTOCOL: &[u8] = b"usb-direct-transfer/4";
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 const MIN_PREVIEW_BYTES: u64 = 32 * 1024 * 1024;
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1294,7 +1295,7 @@ mod tests {
     }
 
     #[test]
-    fn streaming_retry_replaces_a_damaged_prefix() -> Result<()> {
+    fn streaming_retry_keeps_checkpoints_before_damaged_data() -> Result<()> {
         retry_after_cancel(true, true)
     }
 
@@ -1330,24 +1331,24 @@ mod tests {
             transfer::prepare(paths, &cancelled)?
         };
 
+        let stop = if damaged_prefix { 52 } else { 20 } * 1024 * 1024;
         receive_until_canceled(&batch, &output, |done, total| {
-            done >= first.len() as u64 + 20 * 1024 * 1024 && done < total
+            done >= first.len() as u64 + stop && done < total
         })?;
         assert!(!output.join("batch").exists());
         let pending = transfer::pending(&output)?;
         assert_eq!(pending[0].bytes, first.len() as u64);
-        assert!(pending[0].partial_bytes >= 20 * 1024 * 1024);
+        assert!(pending[0].partial_bytes >= stop);
         assert!(pending[0].partial_bytes < large_size);
         if damaged_prefix {
-            fs::OpenOptions::new()
-                .write(true)
-                .open(
-                    output
-                        .join(".usb-direct-transfer")
-                        .join(&pending[0].id)
-                        .join(".resume-2"),
-                )?
-                .write_all(b"bad prefix")?;
+            let mut partial = fs::OpenOptions::new().write(true).open(
+                output
+                    .join(".usb-direct-transfer")
+                    .join(&pending[0].id)
+                    .join(".resume-2"),
+            )?;
+            partial.seek(SeekFrom::Start(2 * checkpoint))?;
+            partial.write_all(b"damaged block")?;
         }
 
         let (left, right) = connected(root);
@@ -1364,7 +1365,12 @@ mod tests {
         });
         assert_eq!(
             reused,
-            first.len() as u64 + if damaged_prefix { 0 } else { checkpoint }
+            first.len() as u64
+                + if damaged_prefix {
+                    2 * checkpoint
+                } else {
+                    checkpoint
+                }
         );
         right.next(|event| {
             matches!(
