@@ -22,11 +22,14 @@ const DISCOVERY_V6: Ipv6Addr = Ipv6Addr::new(0xff12, 0, 0, 0, 0, 0, 0x8ce0, 0xe1
 const DISCOVERY: &[u8; 8] = b"UDT1HERE";
 const AUTOMATIC: &[u8; 8] = b"UDT1AUTO";
 const MANUAL: &[u8; 8] = b"UDT1PAIR";
+const DIRECT: &[u8; 8] = b"UDT1LINK";
 const BENCH_DISCOVERY: &[u8; 8] = b"UDB1HERE";
 const BENCH_AUTOMATIC: &[u8; 8] = b"UDB1AUTO";
 const BENCH_MANUAL: &[u8; 8] = b"UDB1PAIR";
+const BENCH_DIRECT: &[u8; 8] = b"UDB1LINK";
 const PROBE: &[u8; 8] = b"UDT1PING";
 const ACCEPTED: &[u8; 8] = b"UDT1OKAY";
+const DIRECT_CONFIRMED: &[u8; 8] = b"UDT1RDY!";
 const CONNECT_WAIT: Duration = Duration::from_millis(450);
 const PREFACE_WAIT: Duration = Duration::from_secs(2);
 const PORT_RETRY_DELAY: Duration = Duration::from_millis(200);
@@ -59,6 +62,13 @@ impl Mode {
         match self {
             Self::Pair => MANUAL,
             Self::Benchmark => BENCH_MANUAL,
+        }
+    }
+
+    fn direct(self) -> &'static [u8; 8] {
+        match self {
+            Self::Pair => DIRECT,
+            Self::Benchmark => BENCH_DIRECT,
         }
     }
 }
@@ -484,29 +494,52 @@ impl Endpoint {
         stream.set_nonblocking(false)?;
         pin_accepted(&stream, self.address)?;
         preface_limits(&stream)?;
-        let mut magic = [0; 8];
-        if stream.read_exact(&mut magic).is_err() {
-            return Ok(None);
-        }
-        if &magic == PROBE {
-            let _ = stream.write_all(ACCEPTED);
-            return Ok(None);
-        }
-        let valid = if &magic == mode.manual() {
-            origin.ip() < self.address.ip
-        } else if &magic == mode.automatic() && manual.is_none() {
-            let mut identities = [0; 32];
-            stream.read_exact(&mut identities).is_ok()
-                && identities[16..] == id
-                && identities[..16] < id[..]
-        } else {
-            false
-        };
-        if !valid || stream.write_all(ACCEPTED).is_err() {
-            return Ok(None);
-        }
-        Ok(Some(stream))
+        let accepted = accept_preface(
+            &mut stream,
+            mode,
+            id,
+            manual.is_none(),
+            origin.ip() < self.address.ip,
+        )
+        .unwrap_or(false);
+        Ok(accepted.then_some(stream))
     }
+}
+
+fn accept_preface(
+    stream: &mut (impl Read + Write),
+    mode: Mode,
+    id: NodeId,
+    automatic: bool,
+    peer_has_lower_address: bool,
+) -> io::Result<bool> {
+    let mut magic = [0; 8];
+    stream.read_exact(&mut magic)?;
+    if &magic == PROBE {
+        stream.write_all(ACCEPTED)?;
+        return Ok(false);
+    }
+    if &magic == mode.direct() {
+        stream.write_all(ACCEPTED)?;
+        // Both computers may have tried dialing. Wait for confirmation so a
+        // socket left in the listener queue by a timed-out dial is discarded.
+        let mut confirmation = [0; 8];
+        stream.read_exact(&mut confirmation)?;
+        return Ok(&confirmation == DIRECT_CONFIRMED);
+    }
+    let valid = if &magic == mode.manual() {
+        peer_has_lower_address
+    } else if &magic == mode.automatic() && automatic {
+        let mut identities = [0; 32];
+        stream.read_exact(&mut identities)?;
+        identities[16..] == id && identities[..16] < id[..]
+    } else {
+        false
+    };
+    if valid {
+        stream.write_all(ACCEPTED)?;
+    }
+    Ok(valid)
 }
 
 fn preface_limits(stream: &TcpStream) -> io::Result<()> {
@@ -530,6 +563,11 @@ fn establish(address: Address, peer: IpAddr, magic: &[u8; 8], data: &[u8]) -> Re
         .context("Could not reach the pairing listener on the selected cable")?;
     let mut stream: TcpStream = client.into();
     preface_limits(&stream)?;
+    initiate_preface(&mut stream, magic, data)?;
+    Ok(stream)
+}
+
+fn initiate_preface(stream: &mut (impl Read + Write), magic: &[u8; 8], data: &[u8]) -> Result<()> {
     stream.write_all(magic)?;
     stream.write_all(data)?;
     let mut reply = [0; 8];
@@ -538,7 +576,30 @@ fn establish(address: Address, peer: IpAddr, magic: &[u8; 8], data: &[u8]) -> Re
         &reply == ACCEPTED,
         "Peer did not recognize the cable pairing protocol"
     );
-    Ok(stream)
+    if magic == DIRECT || magic == BENCH_DIRECT {
+        stream.write_all(DIRECT_CONFIRMED)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn establish_direct(address: Address, peer: IpAddr, mode: Mode) -> Result<TcpStream> {
+    match establish(address, peer, mode.direct(), &[]) {
+        Ok(stream) => Ok(stream),
+        Err(error)
+            if address.ip < peer
+                && error.downcast_ref::<io::Error>().is_some_and(|error| {
+                    matches!(
+                        error.kind(),
+                        io::ErrorKind::UnexpectedEof | io::ErrorKind::ConnectionReset
+                    )
+                }) =>
+        {
+            // Older peers close an unrecognized preface without a reply.
+            establish(address, peer, mode.manual(), &[])
+        }
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) enum ConnectStatus {
@@ -618,11 +679,11 @@ fn connect_mode(
             }
         }
     }
+    let multicast = endpoints
+        .iter()
+        .any(|endpoint| endpoint.discovery.is_some());
     ensure!(
-        manual.is_some()
-            || endpoints
-                .iter()
-                .any(|endpoint| endpoint.discovery.is_some()),
+        manual.is_some() || multicast || cfg!(target_os = "linux"),
         "Discovery could not start on {name}. Try manual pairing on both computers."
     );
     let mut id = [0; 16];
@@ -634,6 +695,8 @@ fn connect_mode(
         "{} on {} ({})",
         if manual.is_some() {
             "Waiting for manual peer"
+        } else if !multicast {
+            "Waiting for a known cable peer"
         } else {
             "Discovering peers"
         },
@@ -647,7 +710,10 @@ fn connect_mode(
     let mut next_advertisement = Instant::now();
     let mut discovery_error_reported = false;
     #[cfg(target_os = "linux")]
-    let mut next_direct_attempt = Instant::now() + DIRECT_RETRY_DELAY;
+    let direct_delay = DIRECT_RETRY_DELAY
+        + Duration::from_millis(u64::from(u16::from_be_bytes([id[0], id[1]]) / 128));
+    #[cfg(target_os = "linux")]
+    let mut next_direct_attempt = Instant::now() + direct_delay;
     while !cancel.load(Ordering::Relaxed) {
         let now = Instant::now();
         for endpoint in &mut endpoints {
@@ -682,10 +748,6 @@ fn connect_mode(
                         if &packet[..8] == mode.discovery()
                             && endpoint.address.directly_reaches(from.ip()) =>
                     {
-                        #[cfg(target_os = "linux")]
-                        {
-                            next_direct_attempt = now + DIRECT_RETRY_DELAY;
-                        }
                         if packet[8..24] <= id[..] || now < endpoint.next_attempt {
                             continue;
                         }
@@ -709,19 +771,25 @@ fn connect_mode(
             next_advertisement = now + Duration::from_millis(625);
         }
         #[cfg(target_os = "linux")]
-        if matches!(mode, Mode::Pair)
-            && manual.is_none()
-            && now >= next_direct_attempt
-            && !cancel.load(Ordering::Relaxed)
-        {
-            next_direct_attempt = now + DIRECT_RETRY_DELAY;
+        if now >= next_direct_attempt && !cancel.load(Ordering::Relaxed) {
+            next_direct_attempt = now + direct_delay;
             // An outbound connection can work when the firewall drops incoming
-            // multicast. Use only a peer already known on this cable.
-            for (address, peer) in linux_direct_peers(&name, &endpoints) {
+            // discovery or pairing traffic. Use a configured peer or a single
+            // peer already known on this cable.
+            let peers = if let Some(peer) = manual {
+                endpoints
+                    .iter()
+                    .filter(|endpoint| endpoint.address.ip > peer)
+                    .map(|endpoint| (endpoint.address, peer))
+                    .collect()
+            } else {
+                linux_direct_peers(&name, &endpoints)
+            };
+            for (address, peer) in peers {
                 if cancel.load(Ordering::Relaxed) {
                     break;
                 }
-                if let Ok(stream) = establish(address, peer, mode.manual(), &[]) {
+                if let Ok(stream) = establish_direct(address, peer, mode) {
                     status(ConnectStatus::Detail(format!(
                         "Connected directly to the cable peer on {name}."
                     )));
@@ -1323,15 +1391,16 @@ fn direct_peers(output: &str, addresses: impl Iterator<Item = Address>) -> Vec<(
             if *peer_mac.get_or_insert(mac) != mac {
                 return Vec::new();
             }
-            // The existing manual preface requires the lower address to dial.
-            if address.ip < neighbor.dst {
-                peer.get_or_insert(neighbor.dst);
+            // Prefer an address that can also accept the original preface.
+            if peer.is_none_or(|current| current < address.ip && address.ip < neighbor.dst) {
+                peer = Some(neighbor.dst);
             }
         }
         if let Some(peer) = peer {
             peers.push((address, peer));
         }
     }
+    peers.sort_by_key(|(address, peer)| address.ip >= *peer);
     peers
 }
 
@@ -1596,6 +1665,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn direct_preface_accepts_a_higher_address_for_pairing_and_benchmarks() -> Result<()> {
+        for mode in [Mode::Pair, Mode::Benchmark] {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
+            let mut client = TcpStream::connect(listener.local_addr()?)?;
+            preface_limits(&client)?;
+            let (mut server, _) = listener.accept()?;
+            preface_limits(&server)?;
+            let accepted = thread::spawn(move || -> Result<bool> {
+                Ok(accept_preface(&mut server, mode, [0; 16], false, false)?)
+            });
+            initiate_preface(&mut client, mode.direct(), &[])?;
+            assert!(accepted.join().unwrap()?);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn direct_preface_requires_confirmation_and_an_active_mode() -> Result<()> {
+        let mut unconfirmed = io::Cursor::new(DIRECT.to_vec());
+        assert!(
+            !accept_preface(&mut unconfirmed, Mode::Pair, [0; 16], true, false).unwrap_or(false)
+        );
+        assert_eq!(&unconfirmed.into_inner()[8..], ACCEPTED);
+
+        let mut wrong_mode = io::Cursor::new(DIRECT.to_vec());
+        assert!(!accept_preface(
+            &mut wrong_mode,
+            Mode::Benchmark,
+            [0; 16],
+            true,
+            false
+        )?);
+        assert_eq!(wrong_mode.into_inner(), DIRECT);
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn direct_pairing_uses_a_single_known_peer_on_the_cable() {
@@ -1617,7 +1723,10 @@ mod tests {
         ]"#;
         assert_eq!(
             direct_peers(neighbors, [ipv6, ipv4].into_iter()),
-            vec![(ipv4, "169.254.40.2".parse().unwrap())]
+            vec![
+                (ipv4, "169.254.40.2".parse().unwrap()),
+                (ipv6, "fe80::2".parse().unwrap()),
+            ]
         );
 
         let ambiguous = r#"[

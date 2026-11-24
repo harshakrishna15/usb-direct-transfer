@@ -3,12 +3,17 @@ set -euo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 binary="${1:-target/release/usb-transfer-gui}"
+cli="${2:-}"
 if [[ "$(uname -s)" != Darwin ]]; then
     echo "Run this script on macOS." >&2
     exit 1
 fi
 if [[ ! -f "$binary" || ! -x "$binary" ]]; then
     echo "Build the GUI first: cargo build --locked --release --features gui --bin usb-transfer-gui" >&2
+    exit 1
+fi
+if [[ -n "$cli" && ( ! -f "$cli" || ! -x "$cli" ) ]]; then
+    echo "Build the terminal tool first with cargo build --locked --release --bin usb-transfer." >&2
     exit 1
 fi
 
@@ -30,6 +35,10 @@ trap cleanup EXIT
 
 mkdir -p "$prepared/Contents/MacOS"
 install -m 755 "$binary" "$prepared/Contents/MacOS/usb-transfer-gui"
+if [[ -n "$cli" ]]; then
+    install -m 755 "$cli" "$prepared/Contents/MacOS/usb-transfer"
+    /usr/bin/codesign --force --sign - --timestamp=none "$prepared/Contents/MacOS/usb-transfer"
+fi
 cat > "$prepared/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -56,6 +65,9 @@ PLIST
 /usr/bin/plutil -lint "$prepared/Contents/Info.plist" >/dev/null
 /usr/bin/codesign --force --sign - --timestamp=none "$prepared"
 /usr/bin/codesign --verify --strict "$prepared"
+if [[ -n "$cli" ]]; then
+    /usr/bin/codesign --verify --strict "$prepared/Contents/MacOS/usb-transfer"
+fi
 if [[ -e "$app" || -L "$app" ]]; then
     mv "$app" "$previous"
 fi

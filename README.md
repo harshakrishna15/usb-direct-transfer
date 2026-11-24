@@ -92,7 +92,7 @@ For manual pairing, open **Settings → Manual pairing**, select the cable inter
 
 If the cable adapters are up but lack addresses on a shared subnet, assign distinct unused private IPv4 addresses to the cable adapters, for example `192.168.77.1` and `192.168.77.2` with subnet mask `255.255.255.0`. Leave the gateway blank on those adapters and use the assigned peer addresses for manual pairing. Allow Local Network access on the Mac if prompted.
 
-Discovery uses link-local multicast on UDP 48394. Pairing and the diagnostics probe use TCP 48393. If discovery stalls on Linux, the app can try an outbound connection to a peer the system already knows on that cable. If a firewall exception is still needed, scope it to the app and the direct cable interface.
+Discovery uses link-local multicast on UDP 48394. Pairing and the diagnostics probe use TCP 48393. If discovery stalls on Linux, pairing and benchmarks can try an outbound connection to a single peer the system already knows on that cable. If a firewall exception is still needed, scope it to the app and the direct cable interface.
 
 If the pairing port is in use, a new attempt waits for it to become free. This applies to the desktop app and terminal commands. You can cancel the waiting attempt while the other session continues.
 
@@ -114,3 +114,5 @@ The encrypted integration tests use localhost. The large-file test uses a 4 GiB 
 On the Mac and Linux hardware, verify CLI transfers in both directions over the actual charging cable first. Include a batch of files and folders, conflicting and Unicode names, and a file larger than 4 GiB. Leave Wi-Fi on during an unplug test, confirm the session ends, and check that a retry after restarting the app reuses verified staged data. For desktop verification, repeat the workflow with both apps and pair the GUI with the CLI in both directions.
 
 For a raw TCP baseline, run `usb-transfer bench --mib 512` on both peers with the same size, adding the same interface and peer options as for pairing if needed. Compare the directional MiB/s with a large encrypted, verified file copy on the same cable, using fast local storage. Use 80% of the raw baseline as a tuning reference.
+
+The Apple silicon download includes the terminal tool inside the app. From the folder containing the app, run `"./USB Direct Transfer.app/Contents/MacOS/usb-transfer" bench --mib 512` on the Mac.

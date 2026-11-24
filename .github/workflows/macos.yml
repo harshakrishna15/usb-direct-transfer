@@ -28,9 +28,12 @@ jobs:
         run: cargo +stable test --locked --release --all-features
       - name: Build and package the Apple silicon app
         run: |
-          cargo +stable build --locked --release --features gui --bin usb-transfer-gui
-          ./scripts/package-macos.sh
-          xcrun lipo "target/release/USB Direct Transfer.app/Contents/MacOS/usb-transfer-gui" -verify_arch arm64
+          cargo +stable build --locked --release --features gui --bins
+          ./scripts/package-macos.sh target/release/usb-transfer-gui target/release/usb-transfer
+          bundle="target/release/USB Direct Transfer.app/Contents/MacOS"
+          xcrun lipo "$bundle/usb-transfer-gui" -verify_arch arm64
+          xcrun lipo "$bundle/usb-transfer" -verify_arch arm64
+          "$bundle/usb-transfer" bench --help
           ditto -c -k --sequesterRsrc --keepParent "target/release/USB Direct Transfer.app" \
             "target/release/USB-Direct-Transfer-macOS-arm64.zip"
       - name: Upload Mac app
