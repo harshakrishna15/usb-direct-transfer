@@ -20,6 +20,7 @@ use transfer::{Destination, Manifest, OfferPreview, Prepared, Summary};
 
 const PROTOCOL: &[u8] = b"usb-direct-transfer/1";
 const PREVIEW_PROTOCOL: &[u8] = b"usb-direct-transfer/2";
+const STREAM_PROTOCOL: &[u8] = b"usb-direct-transfer/3";
 const MAX_FRAME: usize = 16 * 1024 * 1024;
 const MIN_PREVIEW_BYTES: u64 = 32 * 1024 * 1024;
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -222,14 +223,26 @@ impl ServerCertVerifier for CompareOnScreen {
 trait Io: Read + Write {}
 impl<T: Read + Write> Io for T {}
 
-fn secure(mut tcp: TcpStream, client: bool) -> Result<(Box<dyn Io>, String, bool)> {
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Protocol {
+    #[default]
+    Legacy,
+    Preview,
+    Streaming,
+}
+
+fn secure(mut tcp: TcpStream, client: bool) -> Result<(Box<dyn Io>, String, Protocol)> {
     tcp.set_read_timeout(Some(RESPONSE_TIMEOUT))?;
     tcp.set_write_timeout(Some(RESPONSE_TIMEOUT))?;
     tcp.set_nodelay(true)?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let label = b"EXPORTER-Channel-Binding";
-    let versions = vec![PREVIEW_PROTOCOL.to_vec(), PROTOCOL.to_vec()];
-    let (stream, material, previews): (Box<dyn Io>, [u8; 32], bool) = if client {
+    let versions = vec![
+        STREAM_PROTOCOL.to_vec(),
+        PREVIEW_PROTOCOL.to_vec(),
+        PROTOCOL.to_vec(),
+    ];
+    let (stream, material, protocol): (Box<dyn Io>, [u8; 32], Protocol) = if client {
         let verifier = CompareOnScreen(provider.signature_verification_algorithms);
         let mut config = ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13])?
@@ -242,9 +255,9 @@ fn secure(mut tcp: TcpStream, client: bool) -> Result<(Box<dyn Io>, String, bool
             ServerName::try_from("usb-transfer.local")?,
         )?;
         conn.complete_io(&mut tcp).context("TLS handshake failed")?;
-        let previews = preview_support(conn.alpn_protocol())?;
+        let protocol = negotiated_protocol(conn.alpn_protocol())?;
         let material = conn.export_keying_material([0; 32], label, Some(&[]))?;
-        (Box::new(StreamOwned::new(conn, tcp)), material, previews)
+        (Box::new(StreamOwned::new(conn, tcp)), material, protocol)
     } else {
         let key = generate_simple_self_signed(vec!["usb-transfer.local".into()])?;
         let mut config = ServerConfig::builder_with_provider(provider)
@@ -257,21 +270,22 @@ fn secure(mut tcp: TcpStream, client: bool) -> Result<(Box<dyn Io>, String, bool
         config.alpn_protocols = versions;
         let mut conn = ServerConnection::new(Arc::new(config))?;
         conn.complete_io(&mut tcp).context("TLS handshake failed")?;
-        let previews = preview_support(conn.alpn_protocol())?;
+        let protocol = negotiated_protocol(conn.alpn_protocol())?;
         let material = conn.export_keying_material([0; 32], label, Some(&[]))?;
-        (Box::new(StreamOwned::new(conn, tcp)), material, previews)
+        (Box::new(StreamOwned::new(conn, tcp)), material, protocol)
     };
     Ok((
         stream,
         pairing_code(material[..10].try_into().unwrap()),
-        previews,
+        protocol,
     ))
 }
 
-fn preview_support(protocol: Option<&[u8]>) -> Result<bool> {
+fn negotiated_protocol(protocol: Option<&[u8]>) -> Result<Protocol> {
     match protocol {
-        Some(PREVIEW_PROTOCOL) => Ok(true),
-        Some(PROTOCOL) => Ok(false),
+        Some(STREAM_PROTOCOL) => Ok(Protocol::Streaming),
+        Some(PREVIEW_PROTOCOL) => Ok(Protocol::Preview),
+        Some(PROTOCOL) => Ok(Protocol::Legacy),
         _ => bail!("Incompatible transfer protocol"),
     }
 }
@@ -349,6 +363,7 @@ enum Frame<Batch = Manifest, Report = Summary> {
     Offer(Batch),
     Waiting,
     Accept,
+    AcceptPrehashed,
     Decline,
     Receipt(Report),
     ReceiptConfirmed,
@@ -475,9 +490,16 @@ fn outgoing(stream: &mut impl Io, offer: OutgoingOffer, updates: &Updates) -> Re
     stream.flush()?;
     drop(frame);
     emit(updates, Event::AwaitingApproval(true));
-    loop {
+    let prehashed = loop {
         match read_frame(stream)? {
-            Frame::Accept => break,
+            Frame::Accept => break false,
+            Frame::AcceptPrehashed
+                if ready
+                    .as_ref()
+                    .is_some_and(|offer| offer.batch.manifest.is_streaming()) =>
+            {
+                break true;
+            }
             Frame::Waiting => {
                 if let Some(preparation) = &preparation {
                     if ready.is_none()
@@ -502,7 +524,7 @@ fn outgoing(stream: &mut impl Io, offer: OutgoingOffer, updates: &Updates) -> Re
             }
             _ => bail!("Unexpected response to the transfer offer"),
         }
-    }
+    };
     emit(updates, Event::AwaitingApproval(false));
     let PreparedOffer { batch, frame } = match ready {
         Some(offer) => offer,
@@ -510,13 +532,10 @@ fn outgoing(stream: &mut impl Io, offer: OutgoingOffer, updates: &Updates) -> Re
             let preparation = preparation
                 .as_ref()
                 .context("Missing transfer preparation")?;
-            loop {
-                match receive_preparation(&preparation.ready, OFFER_HEARTBEAT) {
-                    Some(Ok(offer)) => break offer,
-                    Some(Err(error)) => return withdraw_offer(stream, updates, error),
-                    None => write_frame(stream, Frame::Waiting)?,
-                }
-            }
+            let Some(offer) = wait_for_preparation(stream, updates, preparation)? else {
+                return Ok(());
+            };
+            offer
         }
     };
     if preparation.is_some() {
@@ -524,6 +543,19 @@ fn outgoing(stream: &mut impl Io, offer: OutgoingOffer, updates: &Updates) -> Re
         stream.flush()?;
     }
     drop(frame);
+    let batch = if prehashed {
+        let preparation = prepare_legacy_retry(batch);
+        let Some(PreparedOffer { batch, frame }) =
+            wait_for_preparation(stream, updates, &preparation)?
+        else {
+            return Ok(());
+        };
+        stream.write_all(&frame)?;
+        stream.flush()?;
+        batch
+    } else {
+        batch
+    };
     transfer::send(stream, &batch, progress(updates, false)).context("Sending files failed")?;
     stream.flush()?;
     let Frame::Receipt(mut summary) = read_frame(stream)? else {
@@ -541,6 +573,36 @@ fn outgoing(stream: &mut impl Io, offer: OutgoingOffer, updates: &Updates) -> Re
     );
     write_frame(stream, Frame::ReceiptConfirmed)?;
     Ok(())
+}
+
+fn wait_for_preparation(
+    stream: &mut impl Write,
+    updates: &Updates,
+    preparation: &PendingOffer,
+) -> Result<Option<PreparedOffer>> {
+    loop {
+        match receive_preparation(&preparation.ready, OFFER_HEARTBEAT) {
+            Some(Ok(offer)) => return Ok(Some(offer)),
+            Some(Err(error)) => {
+                withdraw_offer(stream, updates, error)?;
+                return Ok(None);
+            }
+            None => write_frame(stream, Frame::Waiting)?,
+        }
+    }
+}
+
+fn prepare_legacy_retry(mut batch: Prepared) -> PendingOffer {
+    let (complete, ready) = mpsc::channel();
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let worker_cancelled = Arc::clone(&cancelled);
+    thread::spawn(move || {
+        let result = batch
+            .finish_hashes(&worker_cancelled)
+            .and_then(|()| PreparedOffer::encode(batch));
+        let _ = complete.send(result);
+    });
+    PendingOffer { ready, cancelled }
 }
 
 fn withdraw_offer(stream: &mut impl Write, updates: &Updates, error: anyhow::Error) -> Result<()> {
@@ -618,27 +680,35 @@ fn incoming(
             }
         }
     };
-    write_frame(stream, Frame::Accept)?;
+    let prehashed = match &offer {
+        IncomingOffer::Ready(manifest) => to.has_prehashed_progress(manifest)?,
+        IncomingOffer::Preview(_) => false,
+    };
+    write_frame(
+        stream,
+        if prehashed {
+            Frame::AcceptPrehashed
+        } else {
+            Frame::Accept
+        },
+    )?;
     emit(updates, Event::IncomingClosed { accepted: true });
     let manifest = match offer {
+        IncomingOffer::Ready(initial) if prehashed => {
+            let Some(manifest) = read_prehashed_offer(stream, updates)? else {
+                return Ok(true);
+            };
+            initial.verify_prehashed_offer(&manifest)?;
+            manifest
+        }
         IncomingOffer::Ready(manifest) => manifest,
-        IncomingOffer::Preview(preview) => loop {
-            match read_frame(stream)? {
-                Frame::Waiting => {}
-                Frame::Offer(manifest) => {
-                    preview.verify(&manifest)?;
-                    break manifest;
-                }
-                Frame::Decline => {
-                    emit(
-                        updates,
-                        Event::Error("The sender could not prepare the batch.".into()),
-                    );
-                    return Ok(true);
-                }
-                _ => bail!("Unexpected response while preparing the transfer"),
-            }
-        },
+        IncomingOffer::Preview(preview) => {
+            let Some(manifest) = read_prehashed_offer(stream, updates)? else {
+                return Ok(true);
+            };
+            preview.verify(&manifest)?;
+            manifest
+        }
     };
     let summary = transfer::receive(stream, &manifest, &to, cancelled, progress(updates, true))
         .context("Receiving files failed")?;
@@ -660,9 +730,38 @@ fn incoming(
     Ok(true)
 }
 
+fn read_prehashed_offer(stream: &mut impl Read, updates: &Updates) -> Result<Option<Manifest>> {
+    loop {
+        match read_frame(stream)? {
+            Frame::Waiting => {}
+            Frame::Offer(manifest) if !manifest.is_streaming() => return Ok(Some(manifest)),
+            Frame::Decline => {
+                emit(
+                    updates,
+                    Event::Error("The sender could not prepare the batch.".into()),
+                );
+                return Ok(None);
+            }
+            _ => bail!("Unexpected response while preparing the transfer"),
+        }
+    }
+}
+
 struct PreparedOffer {
     batch: Prepared,
     frame: Vec<u8>,
+}
+
+impl PreparedOffer {
+    fn encode(mut batch: Prepared) -> Result<Self> {
+        let frame = match encode_frame(Frame::<&Manifest>::Offer(&batch.manifest)) {
+            Err(error) if frame_too_large(&error) && batch.omit_checkpoints() => {
+                encode_frame(Frame::<&Manifest>::Offer(&batch.manifest))
+            }
+            result => result,
+        }?;
+        Ok(Self { batch, frame })
+    }
 }
 
 enum OutgoingOffer {
@@ -698,7 +797,7 @@ fn receive_preparation<T>(ready: &mpsc::Receiver<Result<T>>, wait: Duration) -> 
 struct Preparation {
     pending: Option<mpsc::Receiver<Result<OutgoingOffer>>>,
     cancelled: Arc<AtomicBool>,
-    previews: bool,
+    protocol: Protocol,
 }
 
 impl Preparation {
@@ -713,12 +812,16 @@ impl Preparation {
         let (ready, prepared) = mpsc::channel();
         self.cancelled = Arc::new(AtomicBool::new(false));
         let cancelled = Arc::clone(&self.cancelled);
-        let previews = self.previews;
+        let protocol = self.protocol;
         thread::spawn(move || {
             let mut deferred = None;
-            let batch = if previews {
-                transfer::prepare_with_preview(&paths, &cancelled, |preview| {
-                    if preview.bytes >= MIN_PREVIEW_BYTES {
+            let offer = (|| {
+                let (mut batch, bytes) = transfer::scan_batch(&paths, &cancelled)?;
+                if protocol == Protocol::Streaming && bytes >= MIN_PREVIEW_BYTES {
+                    batch.enable_streaming(&paths)?;
+                } else {
+                    if protocol == Protocol::Preview && bytes >= MIN_PREVIEW_BYTES {
+                        let preview = batch.preview(bytes);
                         let frame = encode_frame(Frame::<Manifest>::Preview(preview))?;
                         let (complete, result) = mpsc::channel();
                         let preparation = PendingOffer {
@@ -730,20 +833,10 @@ impl Preparation {
                             .map_err(|_| anyhow::anyhow!("Transfer preparation canceled"))?;
                         deferred = Some(complete);
                     }
-                    Ok(())
-                })
-            } else {
-                transfer::prepare(&paths, &cancelled)
-            };
-            let offer = batch.and_then(|mut batch| {
-                let frame = match encode_frame(Frame::<&Manifest>::Offer(&batch.manifest)) {
-                    Err(error) if frame_too_large(&error) && batch.omit_checkpoints() => {
-                        encode_frame(Frame::<&Manifest>::Offer(&batch.manifest))
-                    }
-                    result => result,
-                }?;
-                Ok(PreparedOffer { batch, frame })
-            });
+                    batch.finish_hashes(&cancelled)?;
+                }
+                PreparedOffer::encode(batch)
+            })();
             if let Some(complete) = deferred {
                 let _ = complete.send(offer);
             } else {
@@ -776,7 +869,7 @@ fn run(
     updates: &Updates,
     cancelled: &AtomicBool,
 ) -> Result<()> {
-    let (mut stream, code, previews) = secure(tcp, client)?;
+    let (mut stream, code, protocol) = secure(tcp, client)?;
     emit(updates, Event::PairCode(code));
     if !confirm(&mut stream, requests, updates)? {
         return Ok(());
@@ -787,7 +880,7 @@ fn run(
     let mut preparation = Preparation {
         pending: None,
         cancelled: Arc::new(AtomicBool::new(false)),
-        previews,
+        protocol,
     };
     while !cancelled.load(Ordering::Relaxed) {
         // Keep the idle-turn limit while waking promptly for a local
@@ -817,8 +910,14 @@ fn run(
             }
         } else {
             let offer = match read_frame(&mut stream)? {
-                Frame::Offer(manifest) => Some(IncomingOffer::Ready(manifest)),
-                Frame::Preview(preview) if previews => Some(IncomingOffer::Preview(preview)),
+                Frame::Offer(manifest)
+                    if !manifest.is_streaming() || protocol == Protocol::Streaming =>
+                {
+                    Some(IncomingOffer::Ready(manifest))
+                }
+                Frame::Preview(preview) if protocol != Protocol::Legacy => {
+                    Some(IncomingOffer::Preview(preview))
+                }
                 Frame::Idle => None,
                 _ => bail!("Unexpected frame outside a transfer"),
             };
@@ -1186,6 +1285,20 @@ mod tests {
 
     #[test]
     fn canceling_a_download_preserves_verified_files_and_checkpoints_for_retry() -> Result<()> {
+        retry_after_cancel(false, false)
+    }
+
+    #[test]
+    fn streaming_retry_reuses_the_saved_prefix() -> Result<()> {
+        retry_after_cancel(true, false)
+    }
+
+    #[test]
+    fn streaming_retry_replaces_a_damaged_prefix() -> Result<()> {
+        retry_after_cancel(true, true)
+    }
+
+    fn retry_after_cancel(streaming: bool, damaged_prefix: bool) -> Result<()> {
         use std::io::{Seek, SeekFrom};
 
         let temp = tempfile::tempdir()?;
@@ -1207,7 +1320,15 @@ mod tests {
         large.seek(SeekFrom::End(-4))?;
         large.write_all(b"tail")?;
         drop(large);
-        let batch = transfer::prepare(std::slice::from_ref(&folder), &AtomicBool::new(false))?;
+        let paths = std::slice::from_ref(&folder);
+        let cancelled = AtomicBool::new(false);
+        let batch = if streaming {
+            let (mut batch, _) = transfer::scan_batch(paths, &cancelled)?;
+            batch.enable_streaming(paths)?;
+            batch
+        } else {
+            transfer::prepare(paths, &cancelled)?
+        };
 
         receive_until_canceled(&batch, &output, |done, total| {
             done >= first.len() as u64 + 20 * 1024 * 1024 && done < total
@@ -1217,6 +1338,17 @@ mod tests {
         assert_eq!(pending[0].bytes, first.len() as u64);
         assert!(pending[0].partial_bytes >= 20 * 1024 * 1024);
         assert!(pending[0].partial_bytes < large_size);
+        if damaged_prefix {
+            fs::OpenOptions::new()
+                .write(true)
+                .open(
+                    output
+                        .join(".usb-direct-transfer")
+                        .join(&pending[0].id)
+                        .join(".resume-2"),
+                )?
+                .write_all(b"bad prefix")?;
+        }
 
         let (left, right) = connected(root);
         pair(&left, &right);
@@ -1230,7 +1362,10 @@ mod tests {
             } => Some(done),
             _ => None,
         });
-        assert_eq!(reused, first.len() as u64 + checkpoint);
+        assert_eq!(
+            reused,
+            first.len() as u64 + if damaged_prefix { 0 } else { checkpoint }
+        );
         right.next(|event| {
             matches!(
                 event,

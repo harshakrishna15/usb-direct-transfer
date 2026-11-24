@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 pub(super) const REQUESTS_WITH_CHECKPOINTS: usize = u32::MAX as usize - 1;
 pub(super) const MAX_CHECKPOINTS: usize = 8192;
 const MAX_PER_FILE: usize = 4096;
-const MIN_INTERVAL: u64 = 16 * 1024 * 1024;
+pub(super) const MIN_INTERVAL: u64 = 16 * 1024 * 1024;
 const FILE_PREFIX: &str = ".resume-";
 
 pub(super) fn interval(bytes: u64, budget: usize) -> u64 {

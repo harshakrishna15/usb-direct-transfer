@@ -1,5 +1,6 @@
 mod resume;
 mod staging_batch;
+mod streaming;
 
 use anyhow::{Context, Result, bail, ensure};
 use filetime::FileTime;
@@ -33,6 +34,8 @@ pub struct Manifest {
     skipped: Vec<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     checkpoints: BTreeMap<usize, Checkpoints>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stream_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,7 +124,44 @@ impl OfferPreview {
 
 struct Source {
     path: PathBuf,
+    identity: FileIdentity,
     checkpoint_states: Vec<digest::Context>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+struct FileIdentity {
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed: i64,
+    #[cfg(unix)]
+    changed_nanos: i64,
+    #[cfg(not(unix))]
+    created: Option<std::time::SystemTime>,
+}
+
+impl FileIdentity {
+    fn from(metadata: &Metadata) -> Self {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            Self {
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                changed: metadata.ctime(),
+                changed_nanos: metadata.ctime_nsec(),
+            }
+        }
+        #[cfg(not(unix))]
+        Self {
+            created: metadata
+                .created()
+                .ok()
+                .filter(|created| *created >= std::time::SystemTime::UNIX_EPOCH),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -132,6 +172,38 @@ struct SourceScan {
 }
 
 impl Prepared {
+    pub(crate) fn preview(&self, bytes: u64) -> OfferPreview {
+        OfferPreview {
+            names: self
+                .manifest
+                .roots
+                .iter()
+                .map(|root| root.name.clone())
+                .collect(),
+            bytes,
+        }
+    }
+
+    pub(crate) fn enable_streaming(&mut self, paths: &[PathBuf]) -> Result<()> {
+        // Scope saved data to the same selection, even when another folder
+        // contains items with identical names, sizes and modification times.
+        let mut hash = digest::Context::new(&digest::SHA256);
+        hash.update(b"usb-direct-transfer streaming source");
+        hash.update(&(paths.len() as u64).to_be_bytes());
+        for path in paths {
+            let path = std::path::absolute(path)?;
+            let bytes = path.as_os_str().as_encoded_bytes();
+            hash.update(&(bytes.len() as u64).to_be_bytes());
+            hash.update(bytes);
+        }
+        for source in self.sources.iter().flatten() {
+            hash.update(&serde_json::to_vec(&source.identity)?);
+        }
+        self.manifest.stream_id = Some(hex_digest(hash.finish()));
+        describe(&self.manifest)?;
+        Ok(())
+    }
+
     pub(crate) fn omit_checkpoints(&mut self) -> bool {
         if self.manifest.checkpoints.is_empty() {
             return false;
@@ -158,6 +230,10 @@ fn is_zero(count: &usize) -> bool {
     *count == 0
 }
 
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 #[derive(Debug, Clone)]
 pub struct Pending {
     pub id: String,
@@ -166,6 +242,45 @@ pub struct Pending {
 }
 
 impl Manifest {
+    pub(crate) fn is_streaming(&self) -> bool {
+        self.stream_id.is_some()
+    }
+
+    pub(crate) fn verify_prehashed_offer(&self, final_offer: &Self) -> Result<()> {
+        describe(final_offer)?;
+        ensure!(
+            !final_offer.is_streaming()
+                && self.skipped == final_offer.skipped
+                && self.roots.len() == final_offer.roots.len()
+                && self
+                    .roots
+                    .iter()
+                    .zip(&final_offer.roots)
+                    .all(|(before, after)| {
+                        before.name == after.name
+                            && before.entries.len() == after.entries.len()
+                            && before
+                                .entries
+                                .iter()
+                                .zip(&after.entries)
+                                .all(|(left, right)| {
+                                    left.relative == right.relative
+                                        && left.modified == right.modified
+                                        && match (&left.kind, &right.kind) {
+                                            (Kind::Directory, Kind::Directory) => true,
+                                            (
+                                                Kind::File { bytes: left, .. },
+                                                Kind::File { bytes: right, .. },
+                                            ) => left == right,
+                                            _ => false,
+                                        }
+                                })
+                    }),
+            "The prepared transfer differs from the approved offer"
+        );
+        Ok(())
+    }
+
     fn entries(&self) -> impl Iterator<Item = &Entry> {
         self.roots.iter().flat_map(|root| root.entries.iter())
     }
@@ -175,30 +290,43 @@ impl Manifest {
         struct Identity<'a> {
             roots: &'a [Root],
             skipped: &'a [String],
+            #[serde(skip_serializing_if = "Option::is_none")]
+            stream_id: Option<&'a str>,
         }
         // The checkpoint plan can vary between peers. Keep the existing
         // staging key so previously verified files are still reusable.
         let encoded = serde_json::to_vec(&Identity {
             roots: &self.roots,
             skipped: &self.skipped,
+            stream_id: self.stream_id.as_deref(),
         })?;
         Ok(hex_digest(digest::digest(&digest::SHA256, &encoded)))
     }
 }
 
+#[cfg(test)]
 pub fn prepare(paths: &[PathBuf], cancelled: &AtomicBool) -> Result<Prepared> {
     prepare_with_preview(paths, cancelled, |_| Ok(()))
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_with_preview(
     paths: &[PathBuf],
     cancelled: &AtomicBool,
     preview: impl FnOnce(OfferPreview) -> Result<()>,
 ) -> Result<Prepared> {
+    let (mut batch, bytes) = scan_batch(paths, cancelled)?;
+    preview(batch.preview(bytes))?;
+    batch.finish_hashes(cancelled)?;
+    Ok(batch)
+}
+
+pub(crate) fn scan_batch(paths: &[PathBuf], cancelled: &AtomicBool) -> Result<(Prepared, u64)> {
     let mut manifest = Manifest {
         roots: Vec::new(),
         skipped: Vec::new(),
         checkpoints: BTreeMap::new(),
+        stream_id: None,
     };
     let mut sources = SourceScan::default();
     for path in paths {
@@ -246,58 +374,60 @@ pub(crate) fn prepare_with_preview(
             .collect::<Vec<_>>()
             .join(", ")
     );
-    preview(OfferPreview {
-        names: manifest
-            .roots
-            .iter()
-            .map(|root| root.name.clone())
-            .collect(),
-        bytes: sources.bytes,
-    })?;
+    Ok((
+        Prepared {
+            manifest,
+            sources: sources.files,
+        },
+        sources.bytes,
+    ))
+}
 
-    let mut remaining_checkpoints = resume::MAX_CHECKPOINTS;
-    let mut buffer = vec![0; CHUNK];
-    for (index, (entry, source)) in manifest
-        .roots
-        .iter_mut()
-        .flat_map(|root| root.entries.iter_mut())
-        .zip(&mut sources.files)
-        .enumerate()
-    {
-        let (Kind::File { bytes, sha256 }, Some(source)) = (&mut entry.kind, source) else {
-            continue;
-        };
-        let interval = resume::interval(*bytes, remaining_checkpoints);
-        let (hash, checkpoints) = hash_source(
-            &source.path,
-            *bytes,
-            entry.modified,
-            interval,
-            &mut buffer,
-            cancelled,
-        )
-        .with_context(|| format!("Cannot prepare {}", display_path(&source.path)))?;
-        *sha256 = hash;
-        if !checkpoints.is_empty() {
-            remaining_checkpoints -= checkpoints.len();
-            manifest.checkpoints.insert(
-                index,
-                Checkpoints {
-                    interval,
-                    digests: checkpoints
-                        .iter()
-                        .map(|state| hex_digest(state.clone().finish()))
-                        .collect(),
-                },
-            );
-            source.checkpoint_states = checkpoints;
+impl Prepared {
+    pub(crate) fn finish_hashes(&mut self, cancelled: &AtomicBool) -> Result<()> {
+        self.manifest.stream_id = None;
+        let manifest = &mut self.manifest;
+        let mut remaining_checkpoints = resume::MAX_CHECKPOINTS;
+        let mut buffer = vec![0; CHUNK];
+        for (index, (entry, source)) in manifest
+            .roots
+            .iter_mut()
+            .flat_map(|root| root.entries.iter_mut())
+            .zip(&mut self.sources)
+            .enumerate()
+        {
+            let (Kind::File { bytes, sha256 }, Some(source)) = (&mut entry.kind, source) else {
+                continue;
+            };
+            let interval = resume::interval(*bytes, remaining_checkpoints);
+            let (hash, checkpoints) = hash_source(
+                &source.path,
+                *bytes,
+                entry.modified,
+                interval,
+                &mut buffer,
+                cancelled,
+            )
+            .with_context(|| format!("Cannot prepare {}", display_path(&source.path)))?;
+            *sha256 = hash;
+            if !checkpoints.is_empty() {
+                remaining_checkpoints -= checkpoints.len();
+                manifest.checkpoints.insert(
+                    index,
+                    Checkpoints {
+                        interval,
+                        digests: checkpoints
+                            .iter()
+                            .map(|state| hex_digest(state.clone().finish()))
+                            .collect(),
+                    },
+                );
+                source.checkpoint_states = checkpoints;
+            }
         }
+        describe(manifest)?;
+        Ok(())
     }
-    describe(&manifest)?;
-    Ok(Prepared {
-        manifest,
-        sources: sources.files,
-    })
 }
 
 fn scan(
@@ -385,6 +515,7 @@ fn scan(
         });
         sources.files.push(Some(Source {
             path: path.to_path_buf(),
+            identity: FileIdentity::from(&metadata),
             checkpoint_states: Vec::new(),
         }));
     } else {
@@ -450,6 +581,12 @@ pub fn describe(manifest: &Manifest) -> Result<(Vec<String>, u64)> {
         manifest.entries().count() + manifest.skipped.len() <= MAX_ENTRIES,
         "Too many items"
     );
+    if let Some(id) = &manifest.stream_id {
+        ensure!(
+            is_digest(id) && manifest.checkpoints.is_empty(),
+            "Invalid streaming manifest"
+        );
+    }
     let mut total = 0_u64;
     let mut index = 0;
     let mut checkpoint_budget = resume::MAX_CHECKPOINTS;
@@ -488,7 +625,14 @@ pub fn describe(manifest: &Manifest) -> Result<(Vec<String>, u64)> {
                 "Duplicate path in transfer"
             );
             if let Kind::File { bytes, sha256 } = &entry.kind {
-                ensure!(is_digest(sha256), "Invalid file hash");
+                ensure!(
+                    if manifest.is_streaming() {
+                        sha256.is_empty()
+                    } else {
+                        is_digest(sha256)
+                    },
+                    "Invalid file hash"
+                );
                 total = total
                     .checked_add(*bytes)
                     .context("Transfer size overflow")?;
@@ -525,6 +669,9 @@ pub fn send(
     mut progress: impl FnMut(u64, u64),
 ) -> Result<()> {
     let (_, total) = describe(&prepared.manifest)?;
+    if prepared.manifest.is_streaming() {
+        return streaming::send(stream, prepared, total, progress);
+    }
     let entries: Vec<_> = prepared.manifest.entries().collect();
     let first = read_prepared(stream)?;
     let with_checkpoints = first == resume::REQUESTS_WITH_CHECKPOINTS;
@@ -652,6 +799,35 @@ impl Destination {
             _lock: lock,
         })
     }
+
+    pub(crate) fn has_prehashed_progress(&self, manifest: &Manifest) -> Result<bool> {
+        if !manifest.is_streaming() || directory_exists(&self.base.join(manifest.id()?))? {
+            return Ok(false);
+        }
+        // Older journals did not record the source selection. Match the saved
+        // layout and sizes before asking for hashes. Only the content-based
+        // staging key can ultimately select and reuse an older journal.
+        for candidate in fs::read_dir(&self.base)? {
+            let candidate = candidate?;
+            if !candidate.file_type()?.is_dir()
+                || !candidate.file_name().to_str().is_some_and(is_digest)
+            {
+                continue;
+            }
+            let stage = candidate.path();
+            let Ok(state) = read_state(&stage) else {
+                continue;
+            };
+            if !state.streaming
+                && validate_state(&state, manifest).is_ok()
+                && legacy_progress_matches(&self.directory, &stage, &state, manifest)
+                    .unwrap_or(false)
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
 }
 
 pub(crate) fn receive(
@@ -685,11 +861,9 @@ pub(crate) fn receive(
             .collect(),
         ..Summary::default()
     };
-    let mut requests = Vec::new();
     let mut staged_roots = Vec::new();
-    let mut remaining = 0;
+    let mut files = Vec::new();
     let mut next_index = 0;
-    let mut buffer = vec![0; CHUNK];
     for (index, root) in manifest.roots.iter().enumerate() {
         let staged_root = stage_item(&stage, index);
         let is_staged = path_exists(&staged_root)?;
@@ -708,97 +882,31 @@ pub(crate) fn receive(
             tick()?;
             let saved_path = checked_path(&saved_root, mapped)?;
             if let Kind::File { bytes, sha256 } = &entry.kind {
-                if !matches_file(&saved_path, *bytes, sha256, &mut buffer, &mut tick)? {
-                    ensure!(
-                        is_staged,
-                        "Previously published data changed: {}",
-                        display_path(&saved_path)
-                    );
-                    let part = resume::path(&stage, file_index);
-                    if *bytes <= staging_batch::MAX_SMALL_FILE
-                        && staging_batch::recover(
-                            &part,
-                            &saved_path,
-                            *bytes,
-                            sha256,
-                            &mut buffer,
-                            &mut tick,
-                        )?
-                    {
-                        continue;
-                    }
-                    let (prefix, offset) =
-                        if let Some(checkpoints) = manifest.checkpoints.get(&file_index) {
-                            let prefix = checkpoints.verify_saved(&part, &mut buffer, &mut tick)?;
-                            let offset = prefix
-                                .as_ref()
-                                .map_or(Ok(0), |prefix| checkpoints.offset(prefix.checkpoint))?;
-                            (prefix, offset)
-                        } else {
-                            (None, 0)
-                        };
-                    requests.push(FileRequest {
-                        index: file_index,
-                        path: saved_path,
-                        bytes: *bytes,
-                        sha256,
-                        prefix,
-                        offset,
-                    });
-                    remaining += bytes - offset;
-                }
+                files.push(StagedFile {
+                    index: file_index,
+                    path: saved_path,
+                    bytes: *bytes,
+                    sha256,
+                    is_staged,
+                });
             } else {
                 require_directory(&saved_path)?;
             }
         }
     }
-
-    {
-        let mut writer = io::BufWriter::new(&mut *stream);
-        // Older peers never advertise checkpoints, so they receive the
-        // original index-only request format.
-        let resuming = requests.iter().any(|request| request.prefix.is_some());
-        if resuming {
-            write_integer(&mut writer, resume::REQUESTS_WITH_CHECKPOINTS)?;
-        }
-        write_integer(&mut writer, requests.len())?;
-        for request in &requests {
-            write_integer(&mut writer, request.index)?;
-            if resuming {
-                let checkpoint = request
-                    .prefix
-                    .as_ref()
-                    .map_or(0, |prefix| prefix.checkpoint);
-                write_integer(&mut writer, checkpoint)?;
-            }
-        }
-        writer.flush()?;
+    if manifest.is_streaming() {
+        streaming::receive(stream, &stage, files, total, cancelled, &mut progress)?;
+    } else {
+        receive_prehashed_files(
+            stream,
+            &stage,
+            manifest,
+            files,
+            total,
+            cancelled,
+            &mut progress,
+        )?;
     }
-    let mut completed = total - remaining;
-    progress(completed, total);
-    let mut small_files = staging_batch::Batch::default();
-    let received = (|| -> Result<()> {
-        for request in requests {
-            ensure!(!cancelled.load(Ordering::Relaxed), "Download canceled");
-            let keep_partial = manifest.checkpoints.contains_key(&request.index);
-            receive_file(
-                stream,
-                &stage,
-                request,
-                keep_partial,
-                &mut buffer,
-                &mut small_files,
-                |size| {
-                    completed += size;
-                    progress(completed, total);
-                    Ok(())
-                },
-            )?;
-        }
-        Ok(())
-    })();
-    // Preserve the verified members of the final group on interruption too.
-    received.and(small_files.flush(&stage))?;
 
     let mut tick = || preparing_pulse(stream, &mut next_pulse, cancelled);
     tick()?;
@@ -876,6 +984,119 @@ pub(crate) fn receive(
     // Keep the publication journal until the sender confirms receipt. A dropped
     // receipt can then be retried without creating a second copy of any item.
     Ok(summary)
+}
+
+struct StagedFile<'a> {
+    index: usize,
+    path: PathBuf,
+    bytes: u64,
+    sha256: &'a str,
+    is_staged: bool,
+}
+
+fn receive_prehashed_files(
+    stream: &mut impl ReadWrite,
+    stage: &Path,
+    manifest: &Manifest,
+    files: Vec<StagedFile<'_>>,
+    total: u64,
+    cancelled: &AtomicBool,
+    mut progress: impl FnMut(u64, u64),
+) -> Result<()> {
+    let mut requests = Vec::new();
+    let mut remaining = 0;
+    let mut buffer = vec![0; CHUNK];
+    let mut next_pulse = Instant::now() + Duration::from_secs(1);
+    let mut tick = || preparing_pulse(stream, &mut next_pulse, cancelled);
+    for StagedFile {
+        index,
+        path,
+        bytes,
+        sha256,
+        is_staged,
+    } in files
+    {
+        tick()?;
+        if matches_file(&path, bytes, sha256, &mut buffer, &mut tick)? {
+            continue;
+        }
+        ensure!(
+            is_staged,
+            "Previously published data changed: {}",
+            display_path(&path)
+        );
+        let part = resume::path(stage, index);
+        if bytes <= staging_batch::MAX_SMALL_FILE
+            && staging_batch::recover(&part, &path, bytes, sha256, &mut buffer, &mut tick)?
+        {
+            continue;
+        }
+        let (prefix, offset) = if let Some(checkpoints) = manifest.checkpoints.get(&index) {
+            let prefix = checkpoints.verify_saved(&part, &mut buffer, &mut tick)?;
+            let offset = prefix
+                .as_ref()
+                .map_or(Ok(0), |prefix| checkpoints.offset(prefix.checkpoint))?;
+            (prefix, offset)
+        } else {
+            (None, 0)
+        };
+        requests.push(FileRequest {
+            index,
+            path,
+            bytes,
+            sha256,
+            prefix,
+            offset,
+        });
+        remaining += bytes - offset;
+    }
+
+    {
+        let mut writer = io::BufWriter::new(&mut *stream);
+        // Older peers never advertise checkpoints, so they receive the
+        // original index-only request format.
+        let resuming = requests.iter().any(|request| request.prefix.is_some());
+        if resuming {
+            write_integer(&mut writer, resume::REQUESTS_WITH_CHECKPOINTS)?;
+        }
+        write_integer(&mut writer, requests.len())?;
+        for request in &requests {
+            write_integer(&mut writer, request.index)?;
+            if resuming {
+                let checkpoint = request
+                    .prefix
+                    .as_ref()
+                    .map_or(0, |prefix| prefix.checkpoint);
+                write_integer(&mut writer, checkpoint)?;
+            }
+        }
+        writer.flush()?;
+    }
+    let mut completed = total - remaining;
+    progress(completed, total);
+    let mut small_files = staging_batch::Batch::default();
+    let received = (|| -> Result<()> {
+        for request in requests {
+            ensure!(!cancelled.load(Ordering::Relaxed), "Download canceled");
+            let keep_partial = manifest.checkpoints.contains_key(&request.index);
+            receive_file(
+                stream,
+                stage,
+                request,
+                keep_partial,
+                &mut buffer,
+                &mut small_files,
+                |size| {
+                    completed += size;
+                    progress(completed, total);
+                    Ok(())
+                },
+            )?;
+        }
+        Ok(())
+    })();
+    // Preserve the verified members of the final group on interruption too.
+    received.and(small_files.flush(stage))
 }
 
 fn receive_file(
@@ -1014,6 +1235,8 @@ struct State {
     version: u32,
     paths: Vec<Vec<Vec<String>>>,
     published: Vec<Option<String>>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    streaming: bool,
 }
 
 fn initialize_stage(
@@ -1030,6 +1253,7 @@ fn initialize_stage(
         version: STATE_VERSION,
         paths: Vec::new(),
         published: vec![None; manifest.roots.len()],
+        streaming: manifest.is_streaming(),
     };
     for (index, root) in manifest.roots.iter().enumerate() {
         let item = stage_item(temp.path(), index);
@@ -1099,6 +1323,74 @@ fn validate_state(state: &State, manifest: &Manifest) -> Result<()> {
         ensure!(saved != STAGING_DIRECTORY, "Invalid saved destination");
     }
     Ok(())
+}
+
+fn legacy_progress_matches(
+    destination: &Path,
+    stage: &Path,
+    state: &State,
+    manifest: &Manifest,
+) -> Result<bool> {
+    let mut file_index = 0;
+    let mut has_progress = false;
+    for (index, root) in manifest.roots.iter().enumerate() {
+        let mut location = stage_item(stage, index);
+        if let Some(saved) = &state.published[index] {
+            if !saved_name_matches(&root.name, saved, &root.entries[0].kind) {
+                return Ok(false);
+            }
+            if !path_exists(&location)? {
+                location = destination.join(saved);
+            }
+        }
+        for (entry, mapped) in root.entries.iter().zip(&state.paths[index]) {
+            let index = file_index;
+            file_index += 1;
+            if let Some((original, actual)) = entry.relative.last().zip(mapped.last())
+                && !saved_name_matches(original, actual, &entry.kind)
+            {
+                return Ok(false);
+            }
+            if let Kind::File { bytes, .. } = &entry.kind {
+                let path = match checked_path(&location, mapped) {
+                    Ok(path) => path,
+                    Err(_) => return Ok(false),
+                };
+                for (path, partial) in [(path, false), (resume::path(stage, index), true)] {
+                    if let Some(metadata) = metadata_if_present(&path)?
+                        && is_regular(&metadata)
+                        && metadata.len() > 0
+                    {
+                        let size_matches = if partial {
+                            metadata.len() <= *bytes
+                        } else {
+                            metadata.len() == *bytes
+                        };
+                        if !size_matches {
+                            return Ok(false);
+                        }
+                        has_progress = true;
+                    }
+                }
+            }
+        }
+    }
+    Ok(has_progress)
+}
+
+fn saved_name_matches(original: &str, saved: &str, kind: &Kind) -> bool {
+    let original = compatible_name(original);
+    let folder = matches!(kind, Kind::Directory);
+    saved == numbered_name(&original, folder, 1)
+        || saved.match_indices(" (").any(|(offset, _)| {
+            saved[offset + 2..]
+                .split_once(')')
+                .and_then(|(copy, _)| copy.parse::<usize>().ok())
+                .is_some_and(|copy| {
+                    (2..=MAX_ENTRIES).contains(&copy)
+                        && saved == numbered_name(&original, folder, copy)
+                })
+        })
 }
 
 fn publication_names(name: String, folder: bool) -> impl Iterator<Item = String> {
@@ -1632,6 +1924,10 @@ fn preparing_pulse(
     cancelled: &AtomicBool,
 ) -> Result<()> {
     ensure!(!cancelled.load(Ordering::Relaxed), "Download canceled");
+    preparation_pulse(stream, next_pulse)
+}
+
+fn preparation_pulse(stream: &mut impl Write, next_pulse: &mut Instant) -> Result<()> {
     if Instant::now() >= *next_pulse {
         write_integer(stream, PREPARING)?;
         stream.flush()?;
@@ -2179,6 +2475,31 @@ mod tests {
         assert_eq!(fs::read(published.join("Photo-猫.jpg"))?, b"top");
         assert_eq!(fs::read(published.join(second))?, b"bottom");
         confirm_receipt(to.path(), &prepared.manifest)?;
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_files_check_their_hash_before_publication() -> Result<()> {
+        let source = tempfile::tempdir()?;
+        let file = source.path().join("example.txt");
+        fs::write(&file, b"payload")?;
+        let paths = [file];
+        let (mut batch, _) = scan_batch(&paths, &AtomicBool::new(false))?;
+        batch.enable_streaming(&paths)?;
+        let destination = tempfile::tempdir()?;
+
+        let mut incoming = vec![0; 4];
+        incoming.extend_from_slice(b"payload");
+        incoming.extend_from_slice(&[0; 32]);
+        let error = receive(
+            &mut Exchange::new(&incoming),
+            &batch.manifest,
+            destination.path(),
+            |_, _| {},
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("Checksum mismatch"), "{error:#}");
+        assert!(!destination.path().join("example.txt").exists());
         Ok(())
     }
 
