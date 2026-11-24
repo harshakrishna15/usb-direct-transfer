@@ -267,6 +267,15 @@ fn interactive(options: Options, to: &Path) -> Result<()> {
                         for name in summary.skipped {
                             println!("Skipped {name}");
                         }
+                        if summary.additional_renamed > 0 {
+                            println!("More renamed items ({})", summary.additional_renamed);
+                        }
+                        if summary.additional_skipped > 0 {
+                            println!("More skipped items ({})", summary.additional_skipped);
+                        }
+                        if summary.additional_renamed > 0 || summary.additional_skipped > 0 {
+                            println!("The receiving computer has the full list.");
+                        }
                     }
                     Event::Error(error) => {
                         eprintln!("{error}");

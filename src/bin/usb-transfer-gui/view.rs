@@ -646,7 +646,10 @@ impl Desktop {
                     })
                     .inner;
                 if let Some(summary) = summary {
-                    if (!summary.renamed.is_empty() || !summary.skipped.is_empty())
+                    if (!summary.renamed.is_empty()
+                        || !summary.skipped.is_empty()
+                        || summary.additional_renamed > 0
+                        || summary.additional_skipped > 0)
                         && quiet_button(ui, "Renamed and skipped items…").clicked()
                     {
                         self.detail = Some(Detail::TransferResult);
@@ -802,9 +805,24 @@ impl Desktop {
 
     fn transfer_result_ui(&self, ui: &mut Ui, height: f32) {
         if let Some(TransferResult::Completed { summary, .. }) = &self.result {
+            if summary.additional_renamed > 0 {
+                ui.weak(format!(
+                    "More renamed items ({})",
+                    summary.additional_renamed
+                ));
+            }
+            if summary.additional_skipped > 0 {
+                ui.weak(format!(
+                    "More skipped items ({})",
+                    summary.additional_skipped
+                ));
+            }
+            if summary.additional_renamed > 0 || summary.additional_skipped > 0 {
+                ui.weak("The receiving computer has the full list.");
+            }
             let renamed = summary.renamed.len();
             let row_height = ui.text_style_height(&TextStyle::Body);
-            detail_scroll("renamed-and-skipped", height).show_rows(
+            detail_scroll("renamed-and-skipped", height.min(ui.available_height())).show_rows(
                 ui,
                 row_height,
                 renamed + summary.skipped.len(),

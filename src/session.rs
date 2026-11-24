@@ -332,13 +332,13 @@ fn confirm(
 }
 
 #[derive(Serialize, Deserialize)]
-enum Frame<Batch = Manifest> {
+enum Frame<Batch = Manifest, Report = Summary> {
     Idle,
     Offer(Batch),
     Waiting,
     Accept,
     Decline,
-    Receipt(Summary),
+    Receipt(Report),
     ReceiptConfirmed,
 }
 
@@ -369,10 +369,55 @@ fn encode_frame(frame: impl Serialize) -> Result<Vec<u8>> {
     Ok(encoded.0)
 }
 
+fn frame_too_large(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<serde_json::Error>()
+        .and_then(serde_json::Error::io_error_kind)
+        == Some(io::ErrorKind::FileTooLarge)
+}
+
 fn write_frame(stream: &mut impl Write, frame: Frame) -> Result<()> {
     stream.write_all(&encode_frame(frame)?)?;
     stream.flush()?;
     Ok(())
+}
+
+fn write_receipt(stream: &mut impl Write, summary: &Summary) -> Result<()> {
+    let encoded = match encode_frame(Frame::<Manifest, _>::Receipt(summary)) {
+        Err(error) if frame_too_large(&error) => {
+            let renamed = receipt_excerpt(&summary.renamed);
+            let skipped = receipt_excerpt(&summary.skipped);
+            encode_frame(Frame::<Manifest>::Receipt(Summary {
+                additional_renamed: summary.renamed.len() - renamed.len(),
+                additional_skipped: summary.skipped.len() - skipped.len(),
+                renamed,
+                skipped,
+            }))
+        }
+        result => result,
+    }?;
+    stream.write_all(&encoded)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn receipt_excerpt(details: &[String]) -> Vec<String> {
+    // Split the frame budget between the two lists. Allow up to six bytes
+    // of JSON escaping per byte of text, plus quotes and a comma per item.
+    let mut remaining = (MAX_FRAME - 1024) / 2;
+    details
+        .iter()
+        .filter(|line| {
+            let size = line.len().saturating_mul(6).saturating_add(3);
+            if let Some(left) = remaining.checked_sub(size) {
+                remaining = left;
+                true
+            } else {
+                false
+            }
+        })
+        .cloned()
+        .collect()
 }
 
 fn read_frame(stream: &mut impl Read) -> Result<Frame> {
@@ -497,7 +542,7 @@ fn incoming(
     let summary = transfer::receive(stream, &manifest, &to, cancelled, progress(updates, true))
         .context("Receiving files failed")?;
     let receipt = (|| {
-        write_frame(stream, Frame::Receipt(summary.clone()))?;
+        write_receipt(stream, &summary)?;
         let Frame::ReceiptConfirmed = read_frame(stream)? else {
             bail!("Missing transfer receipt confirmation");
         };
@@ -538,15 +583,9 @@ impl Preparation {
         let cancelled = Arc::clone(&self.cancelled);
         thread::spawn(move || {
             let offer = transfer::prepare(&paths, &cancelled).and_then(|mut batch| {
-                let frame = match encode_frame(Frame::Offer(&batch.manifest)) {
-                    Err(error)
-                        if error
-                            .downcast_ref::<serde_json::Error>()
-                            .and_then(serde_json::Error::io_error_kind)
-                            == Some(io::ErrorKind::FileTooLarge)
-                            && batch.omit_checkpoints() =>
-                    {
-                        encode_frame(Frame::Offer(&batch.manifest))
+                let frame = match encode_frame(Frame::<&Manifest>::Offer(&batch.manifest)) {
+                    Err(error) if frame_too_large(&error) && batch.omit_checkpoints() => {
+                        encode_frame(Frame::<&Manifest>::Offer(&batch.manifest))
                     }
                     result => result,
                 }?;
@@ -806,6 +845,52 @@ mod tests {
             fs::read(temp.path().join("right-output/photo.jpg"))?,
             b"picture"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn large_receipt_preserves_counts_and_can_be_read_by_older_peers() -> Result<()> {
+        #[derive(Deserialize)]
+        struct OldSummary {
+            renamed: Vec<String>,
+            skipped: Vec<String>,
+        }
+
+        #[derive(Deserialize)]
+        enum OldFrame {
+            Receipt(OldSummary),
+        }
+
+        let original_name = "Catalog export ".repeat(15) + "daily records and photos";
+        let summary = Summary {
+            renamed: vec![format!("{original_name} -> {original_name} (2)"); 34_000],
+            skipped: vec![format!("{original_name} (symbolic link)"); 8_000],
+            ..Summary::default()
+        };
+        assert!(frame_too_large(
+            &encode_frame(Frame::<Manifest, _>::Receipt(&summary)).unwrap_err()
+        ));
+
+        let mut wire = Vec::new();
+        write_receipt(&mut wire, &summary)?;
+        let Frame::Receipt(report) = read_frame(&mut wire.as_slice())? else {
+            bail!("Missing receipt")
+        };
+        assert!(report.additional_renamed > 0);
+        assert!(report.additional_skipped > 0);
+        assert_eq!(
+            report.renamed.len() + report.additional_renamed,
+            summary.renamed.len()
+        );
+        assert_eq!(
+            report.skipped.len() + report.additional_skipped,
+            summary.skipped.len()
+        );
+        assert_eq!(report.renamed.first(), summary.renamed.first());
+        assert_eq!(report.skipped.first(), summary.skipped.first());
+        let OldFrame::Receipt(old_report) = serde_json::from_slice(&wire[4..])?;
+        assert_eq!(old_report.renamed, report.renamed);
+        assert_eq!(old_report.skipped, report.skipped);
         Ok(())
     }
 

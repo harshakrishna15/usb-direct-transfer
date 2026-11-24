@@ -111,6 +111,14 @@ impl Prepared {
 pub struct Summary {
     pub renamed: Vec<String>,
     pub skipped: Vec<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub additional_renamed: usize,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub additional_skipped: usize,
+}
+
+fn is_zero(count: &usize) -> bool {
+    *count == 0
 }
 
 #[derive(Debug, Clone)]
