@@ -997,7 +997,7 @@ mod tests {
         let first = b"already verified";
         fs::write(folder.join("a.txt"), first)?;
         let large_path = folder.join("b.bin");
-        let large_size = 40 * 1024 * 1024;
+        let large_size = 64 * 1024 * 1024;
         let checkpoint = 16 * 1024 * 1024;
         let mut large = fs::File::create(&large_path)?;
         large.set_len(large_size)?;

@@ -17,6 +17,7 @@ const STAGING_DIRECTORY: &str = ".usb-direct-transfer";
 const MAX_ENTRIES: usize = 100_000;
 const MAX_DEPTH: usize = 128;
 const CHUNK: usize = 1024 * 1024;
+const PARALLEL_CHECKSUM_MIN_BYTES: u64 = 32 * 1024 * 1024;
 const PUBLICATION_BATCH_SIZE: usize = 32;
 const STATE_VERSION: u32 = 1;
 const STAGING_MARKER: &[u8] = b"usb-direct-transfer staging v1\n";
@@ -517,7 +518,7 @@ pub fn send(
         } else {
             digest::Context::new(&digest::SHA256)
         };
-        copy_hashed(
+        copy_payload(
             &mut source,
             stream,
             *bytes - offset,
@@ -837,7 +838,7 @@ fn receive_file(
         };
         file.set_len(offset)?;
         file.seek(SeekFrom::Start(offset))?;
-        copy_hashed(
+        copy_payload(
             stream,
             &mut file,
             bytes - offset,
@@ -853,8 +854,16 @@ fn receive_file(
         let mut part = tempfile::Builder::new()
             .prefix(".partial-")
             .tempfile_in(stage)?;
-        let actual = copy_exact(stream, part.as_file_mut(), bytes, buffer, copied)?;
-        verify(&actual)?;
+        let mut hasher = digest::Context::new(&digest::SHA256);
+        copy_payload(
+            stream,
+            part.as_file_mut(),
+            bytes,
+            buffer,
+            &mut hasher,
+            copied,
+        )?;
+        verify(&hex_digest(hasher.finish()))?;
         if grouped {
             return small_files.add(stage, index, path, part);
         }
@@ -1457,6 +1466,65 @@ fn copy_hashed(
         copied(count as u64)?;
     }
     Ok(())
+}
+
+fn copy_payload(
+    source: &mut impl Read,
+    destination: &mut impl Write,
+    mut bytes: u64,
+    buffer: &mut [u8],
+    hasher: &mut digest::Context,
+    mut copied: impl FnMut(u64) -> Result<()>,
+) -> Result<()> {
+    use std::{sync::mpsc, thread};
+
+    if bytes < PARALLEL_CHECKSUM_MIN_BYTES
+        || !thread::available_parallelism().is_ok_and(|cores| cores.get() > 1)
+    {
+        return copy_hashed(source, destination, bytes, buffer, hasher, copied);
+    }
+
+    // Hash each filled buffer in order while the transfer uses the other one.
+    let mut spare = vec![0; buffer.len()];
+    thread::scope(|scope| {
+        let (recycle, available) = mpsc::sync_channel(2);
+        let (submit, submitted) = mpsc::sync_channel::<(&mut [u8], usize)>(1);
+        recycle.send(buffer).expect("both checksum buffers fit");
+        recycle
+            .send(spare.as_mut_slice())
+            .expect("both checksum buffers fit");
+        let worker = thread::Builder::new().spawn_scoped(scope, move || {
+            while let Ok((buffer, count)) = submitted.recv() {
+                hasher.update(&buffer[..count]);
+                if recycle.send(buffer).is_err() {
+                    break;
+                }
+            }
+        })?;
+
+        let result = (|| -> Result<()> {
+            while bytes > 0 {
+                let buffer = available.recv().context("Checksum worker stopped")?;
+                let count = bytes.min(buffer.len() as u64) as usize;
+                let chunk = &mut buffer[..count];
+                source.read_exact(chunk)?;
+                destination.write_all(chunk)?;
+                submit
+                    .send((buffer, count))
+                    .map_err(|_| anyhow::anyhow!("Checksum worker stopped"))?;
+                bytes -= count as u64;
+                copied(count as u64)?;
+            }
+            Ok(())
+        })();
+
+        // Keep the recycle queue alive while the worker finishes submitted data.
+        drop(submit);
+        worker
+            .join()
+            .map_err(|_| anyhow::anyhow!("Checksum worker stopped"))?;
+        result
+    })
 }
 
 fn matches_file(
