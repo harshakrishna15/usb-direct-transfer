@@ -199,6 +199,7 @@ struct Desktop {
     last_sent: Vec<PathBuf>,
     incoming: Option<Incoming>,
     sending: bool,
+    awaiting_approval: bool,
     receiving: bool,
     progress: Option<Progress>,
     result: Option<TransferResult>,
@@ -241,6 +242,7 @@ impl Desktop {
             last_sent: Vec::new(),
             incoming: None,
             sending: false,
+            awaiting_approval: false,
             receiving: false,
             progress: None,
             result: None,
@@ -447,6 +449,7 @@ impl Desktop {
             self.error = None;
             self.result = None;
             self.sending = true;
+            self.awaiting_approval = false;
             true
         } else {
             false
@@ -508,6 +511,7 @@ impl Desktop {
                         self.pairing = Pairing::Paired;
                     }
                 }
+                Event::AwaitingApproval(waiting) => self.awaiting_approval = waiting,
                 Event::Incoming { names, bytes } => {
                     self.incoming = Some(Incoming { names, bytes });
                     self.detail = None;

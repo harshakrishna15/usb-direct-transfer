@@ -674,6 +674,7 @@ impl Desktop {
                 Some(progress) if progress.receiving => "Receiving files",
                 Some(_) => "Sending files",
                 None if self.receiving => "Preparing download…",
+                None if self.awaiting_approval => "Waiting for approval…",
                 None => "Preparing transfer…",
             }
         };

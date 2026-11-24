@@ -84,15 +84,51 @@ pub struct Prepared {
     sources: Vec<Option<Source>>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct OfferPreview {
+    names: Vec<String>,
+    pub bytes: u64,
+}
+
+impl OfferPreview {
+    pub(crate) fn display_names(&self) -> Result<Vec<String>> {
+        ensure!(
+            (1..=MAX_ENTRIES).contains(&self.names.len()),
+            "Invalid item count in transfer offer"
+        );
+        self.names
+            .iter()
+            .map(|name| {
+                validate_component(name)?;
+                Ok(display_name(name))
+            })
+            .collect()
+    }
+
+    pub(crate) fn verify(&self, manifest: &Manifest) -> Result<()> {
+        let (_, bytes) = describe(manifest)?;
+        ensure!(
+            bytes == self.bytes
+                && self
+                    .names
+                    .iter()
+                    .eq(manifest.roots.iter().map(|root| &root.name)),
+            "The prepared transfer differs from the approved offer"
+        );
+        Ok(())
+    }
+}
+
 struct Source {
     path: PathBuf,
     checkpoint_states: Vec<digest::Context>,
 }
 
+#[derive(Default)]
 struct SourceScan {
     files: Vec<Option<Source>>,
-    checkpoints: BTreeMap<usize, Checkpoints>,
-    remaining_checkpoints: usize,
+    skipped: Vec<String>,
+    bytes: u64,
 }
 
 impl Prepared {
@@ -151,17 +187,20 @@ impl Manifest {
 }
 
 pub fn prepare(paths: &[PathBuf], cancelled: &AtomicBool) -> Result<Prepared> {
+    prepare_with_preview(paths, cancelled, |_| Ok(()))
+}
+
+pub(crate) fn prepare_with_preview(
+    paths: &[PathBuf],
+    cancelled: &AtomicBool,
+    preview: impl FnOnce(OfferPreview) -> Result<()>,
+) -> Result<Prepared> {
     let mut manifest = Manifest {
         roots: Vec::new(),
         skipped: Vec::new(),
         checkpoints: BTreeMap::new(),
     };
-    let mut sources = SourceScan {
-        files: Vec::new(),
-        checkpoints: BTreeMap::new(),
-        remaining_checkpoints: resume::MAX_CHECKPOINTS,
-    };
-    let mut buffer = vec![0; CHUNK];
+    let mut sources = SourceScan::default();
     for path in paths {
         ensure!(
             !cancelled.load(Ordering::Relaxed),
@@ -189,20 +228,14 @@ pub fn prepare(paths: &[PathBuf], cancelled: &AtomicBool) -> Result<Prepared> {
             name: name.into(),
             entries: Vec::new(),
         };
-        scan(
-            path,
-            Vec::new(),
-            &mut root,
-            &mut sources,
-            &mut manifest.skipped,
-            &mut buffer,
-            cancelled,
-        )
-        .with_context(|| format!("Cannot read {}", display_path(path)))?;
+        validate_component(name)?;
+        scan(path, Vec::new(), &mut root, &mut sources, cancelled)
+            .with_context(|| format!("Cannot read {}", display_path(path)))?;
         if !root.entries.is_empty() {
             manifest.roots.push(root);
         }
     }
+    manifest.skipped = sources.skipped;
     ensure!(
         !manifest.roots.is_empty(),
         "No transferable files or folders. Skipped: {}",
@@ -213,7 +246,53 @@ pub fn prepare(paths: &[PathBuf], cancelled: &AtomicBool) -> Result<Prepared> {
             .collect::<Vec<_>>()
             .join(", ")
     );
-    manifest.checkpoints = sources.checkpoints;
+    preview(OfferPreview {
+        names: manifest
+            .roots
+            .iter()
+            .map(|root| root.name.clone())
+            .collect(),
+        bytes: sources.bytes,
+    })?;
+
+    let mut remaining_checkpoints = resume::MAX_CHECKPOINTS;
+    let mut buffer = vec![0; CHUNK];
+    for (index, (entry, source)) in manifest
+        .roots
+        .iter_mut()
+        .flat_map(|root| root.entries.iter_mut())
+        .zip(&mut sources.files)
+        .enumerate()
+    {
+        let (Kind::File { bytes, sha256 }, Some(source)) = (&mut entry.kind, source) else {
+            continue;
+        };
+        let interval = resume::interval(*bytes, remaining_checkpoints);
+        let (hash, checkpoints) = hash_source(
+            &source.path,
+            *bytes,
+            entry.modified,
+            interval,
+            &mut buffer,
+            cancelled,
+        )
+        .with_context(|| format!("Cannot prepare {}", display_path(&source.path)))?;
+        *sha256 = hash;
+        if !checkpoints.is_empty() {
+            remaining_checkpoints -= checkpoints.len();
+            manifest.checkpoints.insert(
+                index,
+                Checkpoints {
+                    interval,
+                    digests: checkpoints
+                        .iter()
+                        .map(|state| hex_digest(state.clone().finish()))
+                        .collect(),
+                },
+            );
+            source.checkpoint_states = checkpoints;
+        }
+    }
     describe(&manifest)?;
     Ok(Prepared {
         manifest,
@@ -226,8 +305,6 @@ fn scan(
     relative: Vec<String>,
     root: &mut Root,
     sources: &mut SourceScan,
-    skipped: &mut Vec<String>,
-    buffer: &mut [u8],
     cancelled: &AtomicBool,
 ) -> Result<()> {
     ensure!(
@@ -236,20 +313,22 @@ fn scan(
     );
     ensure!(relative.len() <= MAX_DEPTH, "Folder is nested too deeply");
     ensure!(
-        sources.files.len() + skipped.len() < MAX_ENTRIES,
+        sources.files.len() + sources.skipped.len() < MAX_ENTRIES,
         "Too many items"
     );
     let metadata = fs::symlink_metadata(path)?;
     let modified = Modified::from(&metadata);
     if is_link(&metadata) {
-        skipped.push(format!("{} (link)", raw_wire_path(&root.name, &relative)));
+        sources
+            .skipped
+            .push(format!("{} (link)", raw_wire_path(&root.name, &relative)));
     } else if metadata.is_dir() {
         if path
             .file_name()
             .is_some_and(|name| name == STAGING_DIRECTORY)
             && verify_marker(path).is_ok()
         {
-            skipped.push(format!(
+            sources.skipped.push(format!(
                 "{} (transfer staging data)",
                 raw_wire_path(&root.name, &relative)
             ));
@@ -261,7 +340,7 @@ fn scan(
             modified,
         });
         sources.files.push(None);
-        let available = MAX_ENTRIES - sources.files.len() - skipped.len();
+        let available = MAX_ENTRIES - sources.files.len() - sources.skipped.len();
         let mut children = Vec::new();
         for child in fs::read_dir(path)? {
             ensure!(children.len() < available, "Too many items");
@@ -276,10 +355,10 @@ fn scan(
             let name = child.file_name();
             let Some(name) = name.to_str() else {
                 ensure!(
-                    sources.files.len() + skipped.len() < MAX_ENTRIES,
+                    sources.files.len() + sources.skipped.len() < MAX_ENTRIES,
                     "Too many items"
                 );
-                skipped.push(format!(
+                sources.skipped.push(format!(
                     "{}/{} (filename is not UTF-8)",
                     raw_wire_path(&root.name, &relative),
                     name.to_string_lossy()
@@ -288,79 +367,81 @@ fn scan(
             };
             let mut child_relative = relative.clone();
             child_relative.push(name.to_string());
-            scan(
-                &child.path(),
-                child_relative,
-                root,
-                sources,
-                skipped,
-                buffer,
-                cancelled,
-            )?;
+            scan(&child.path(), child_relative, root, sources, cancelled)?;
         }
     } else if metadata.is_file() {
-        let mut file = open_regular(path)?;
         let bytes = metadata.len();
-        let interval = resume::interval(bytes, sources.remaining_checkpoints);
-        let mut hasher = digest::Context::new(&digest::SHA256);
-        let mut checkpoint_states = Vec::new();
-        let mut remaining = bytes;
-        while remaining > 0 {
-            let length = remaining.min(interval);
-            copy_hashed(
-                &mut file,
-                &mut io::sink(),
-                length,
-                buffer,
-                &mut hasher,
-                |_| {
-                    ensure!(
-                        !cancelled.load(Ordering::Relaxed),
-                        "Transfer preparation canceled"
-                    );
-                    Ok(())
-                },
-            )?;
-            remaining -= length;
-            if remaining > 0 {
-                checkpoint_states.push(hasher.clone());
-            }
-        }
-        let sha256 = hex_digest(hasher.finish());
-        let after = file.metadata()?;
-        ensure!(
-            after.len() == bytes && Modified::from(&after) == modified,
-            "File changed while preparing the transfer"
-        );
+        sources.bytes = sources
+            .bytes
+            .checked_add(bytes)
+            .context("Transfer size overflow")?;
         root.entries.push(Entry {
             relative,
-            kind: Kind::File { bytes, sha256 },
+            kind: Kind::File {
+                bytes,
+                sha256: String::new(),
+            },
             modified,
         });
-        if !checkpoint_states.is_empty() {
-            sources.remaining_checkpoints -= checkpoint_states.len();
-            sources.checkpoints.insert(
-                sources.files.len(),
-                Checkpoints {
-                    interval,
-                    digests: checkpoint_states
-                        .iter()
-                        .map(|state| hex_digest(state.clone().finish()))
-                        .collect(),
-                },
-            );
-        }
         sources.files.push(Some(Source {
             path: path.to_path_buf(),
-            checkpoint_states,
+            checkpoint_states: Vec::new(),
         }));
     } else {
-        skipped.push(format!(
+        sources.skipped.push(format!(
             "{} (special file)",
             raw_wire_path(&root.name, &relative)
         ));
     }
     Ok(())
+}
+
+fn hash_source(
+    path: &Path,
+    bytes: u64,
+    modified: Modified,
+    interval: u64,
+    buffer: &mut [u8],
+    cancelled: &AtomicBool,
+) -> Result<(String, Vec<digest::Context>)> {
+    let check_cancelled = || {
+        ensure!(
+            !cancelled.load(Ordering::Relaxed),
+            "Transfer preparation canceled"
+        );
+        Ok(())
+    };
+    check_cancelled()?;
+    let mut file = open_regular(path)?;
+    let before = file.metadata()?;
+    ensure!(
+        before.len() == bytes && Modified::from(&before) == modified,
+        "File changed while preparing the transfer"
+    );
+    let mut hasher = digest::Context::new(&digest::SHA256);
+    let mut checkpoints = Vec::new();
+    let mut remaining = bytes;
+    while remaining > 0 {
+        let length = remaining.min(interval);
+        copy_hashed(
+            &mut file,
+            &mut io::sink(),
+            length,
+            buffer,
+            &mut hasher,
+            |_| check_cancelled(),
+        )?;
+        remaining -= length;
+        if remaining > 0 {
+            checkpoints.push(hasher.clone());
+        }
+    }
+    let after = file.metadata()?;
+    ensure!(
+        after.len() == bytes && Modified::from(&after) == modified,
+        "File changed while preparing the transfer"
+    );
+    Ok((hex_digest(hasher.finish()), checkpoints))
 }
 
 pub fn describe(manifest: &Manifest) -> Result<(Vec<String>, u64)> {
@@ -1738,6 +1819,29 @@ mod tests {
 
     fn prepare(paths: &[PathBuf]) -> Result<Prepared> {
         super::prepare(paths, &AtomicBool::new(false))
+    }
+
+    #[test]
+    fn file_changed_after_its_preview_is_rejected() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("archive.bin");
+        fs::write(&path, b"before")?;
+        let result = prepare_with_preview(
+            std::slice::from_ref(&path),
+            &AtomicBool::new(false),
+            |preview| {
+                assert_eq!(preview.display_names()?, ["archive.bin"]);
+                assert_eq!(preview.bytes, 6);
+                fs::write(&path, b"changed afterwards")?;
+                Ok(())
+            },
+        );
+        let Err(error) = result else {
+            bail!("Prepared a file that changed after its offer")
+        };
+        let error = format!("{error:#}");
+        assert!(error.contains("File changed while preparing"), "{error}");
+        Ok(())
     }
 
     fn receive(

@@ -16,13 +16,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
-use transfer::{Destination, Manifest, Prepared, Summary};
+use transfer::{Destination, Manifest, OfferPreview, Prepared, Summary};
 
 const PROTOCOL: &[u8] = b"usb-direct-transfer/1";
+const PREVIEW_PROTOCOL: &[u8] = b"usb-direct-transfer/2";
 const MAX_FRAME: usize = 16 * 1024 * 1024;
+const MIN_PREVIEW_BYTES: u64 = 32 * 1024 * 1024;
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(180);
 const POLL_INTERVAL: Duration = Duration::from_millis(150);
+const OFFER_HEARTBEAT: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 pub enum Command {
@@ -38,6 +41,7 @@ pub enum Event {
     PairingPortBusy(String),
     PairCode(String),
     Paired,
+    AwaitingApproval(bool),
     Incoming {
         names: Vec<String>,
         bytes: u64,
@@ -218,31 +222,29 @@ impl ServerCertVerifier for CompareOnScreen {
 trait Io: Read + Write {}
 impl<T: Read + Write> Io for T {}
 
-fn secure(mut tcp: TcpStream, client: bool) -> Result<(Box<dyn Io>, String)> {
+fn secure(mut tcp: TcpStream, client: bool) -> Result<(Box<dyn Io>, String, bool)> {
     tcp.set_read_timeout(Some(RESPONSE_TIMEOUT))?;
     tcp.set_write_timeout(Some(RESPONSE_TIMEOUT))?;
     tcp.set_nodelay(true)?;
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let label = b"EXPORTER-Channel-Binding";
-    let (stream, material): (Box<dyn Io>, [u8; 32]) = if client {
+    let versions = vec![PREVIEW_PROTOCOL.to_vec(), PROTOCOL.to_vec()];
+    let (stream, material, previews): (Box<dyn Io>, [u8; 32], bool) = if client {
         let verifier = CompareOnScreen(provider.signature_verification_algorithms);
         let mut config = ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13])?
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(verifier))
             .with_no_client_auth();
-        config.alpn_protocols = vec![PROTOCOL.to_vec()];
+        config.alpn_protocols = versions;
         let mut conn = ClientConnection::new(
             Arc::new(config),
             ServerName::try_from("usb-transfer.local")?,
         )?;
         conn.complete_io(&mut tcp).context("TLS handshake failed")?;
-        ensure!(
-            conn.alpn_protocol() == Some(PROTOCOL),
-            "Incompatible transfer protocol"
-        );
+        let previews = preview_support(conn.alpn_protocol())?;
         let material = conn.export_keying_material([0; 32], label, Some(&[]))?;
-        (Box::new(StreamOwned::new(conn, tcp)), material)
+        (Box::new(StreamOwned::new(conn, tcp)), material, previews)
     } else {
         let key = generate_simple_self_signed(vec!["usb-transfer.local".into()])?;
         let mut config = ServerConfig::builder_with_provider(provider)
@@ -252,17 +254,26 @@ fn secure(mut tcp: TcpStream, client: bool) -> Result<(Box<dyn Io>, String)> {
                 vec![key.cert.der().clone()],
                 PrivatePkcs8KeyDer::from(key.signing_key.serialize_der()).into(),
             )?;
-        config.alpn_protocols = vec![PROTOCOL.to_vec()];
+        config.alpn_protocols = versions;
         let mut conn = ServerConnection::new(Arc::new(config))?;
         conn.complete_io(&mut tcp).context("TLS handshake failed")?;
-        ensure!(
-            conn.alpn_protocol() == Some(PROTOCOL),
-            "Incompatible transfer protocol"
-        );
+        let previews = preview_support(conn.alpn_protocol())?;
         let material = conn.export_keying_material([0; 32], label, Some(&[]))?;
-        (Box::new(StreamOwned::new(conn, tcp)), material)
+        (Box::new(StreamOwned::new(conn, tcp)), material, previews)
     };
-    Ok((stream, pairing_code(material[..10].try_into().unwrap())))
+    Ok((
+        stream,
+        pairing_code(material[..10].try_into().unwrap()),
+        previews,
+    ))
+}
+
+fn preview_support(protocol: Option<&[u8]>) -> Result<bool> {
+    match protocol {
+        Some(PREVIEW_PROTOCOL) => Ok(true),
+        Some(PROTOCOL) => Ok(false),
+        _ => bail!("Incompatible transfer protocol"),
+    }
 }
 
 fn pairing_code(material: [u8; 10]) -> String {
@@ -334,6 +345,7 @@ fn confirm(
 #[derive(Serialize, Deserialize)]
 enum Frame<Batch = Manifest, Report = Summary> {
     Idle,
+    Preview(OfferPreview),
     Offer(Batch),
     Waiting,
     Accept,
@@ -454,22 +466,64 @@ fn progress(updates: &Updates, receiving: bool) -> impl FnMut(u64, u64) + '_ {
     }
 }
 
-fn outgoing(stream: &mut impl Io, offer: PreparedOffer, updates: &Updates) -> Result<()> {
-    let PreparedOffer { batch, frame } = offer;
+fn outgoing(stream: &mut impl Io, offer: OutgoingOffer, updates: &Updates) -> Result<()> {
+    let (frame, mut ready, preparation) = match offer {
+        OutgoingOffer::Ready(mut offer) => (std::mem::take(&mut offer.frame), Some(offer), None),
+        OutgoingOffer::Preview { frame, preparation } => (frame, None, Some(preparation)),
+    };
     stream.write_all(&frame)?;
     stream.flush()?;
     drop(frame);
+    emit(updates, Event::AwaitingApproval(true));
     loop {
         match read_frame(stream)? {
             Frame::Accept => break,
-            Frame::Waiting => {}
+            Frame::Waiting => {
+                if let Some(preparation) = &preparation {
+                    if ready.is_none()
+                        && let Some(result) =
+                            receive_preparation(&preparation.ready, Duration::ZERO)
+                    {
+                        match result {
+                            Ok(offer) => ready = Some(offer),
+                            Err(error) => {
+                                emit(updates, Event::AwaitingApproval(false));
+                                return withdraw_offer(stream, updates, error);
+                            }
+                        }
+                    }
+                    write_frame(stream, Frame::Waiting)?;
+                }
+            }
             Frame::Decline => {
+                emit(updates, Event::AwaitingApproval(false));
                 emit(updates, Event::Error("The peer declined the batch.".into()));
                 return Ok(());
             }
             _ => bail!("Unexpected response to the transfer offer"),
         }
     }
+    emit(updates, Event::AwaitingApproval(false));
+    let PreparedOffer { batch, frame } = match ready {
+        Some(offer) => offer,
+        None => {
+            let preparation = preparation
+                .as_ref()
+                .context("Missing transfer preparation")?;
+            loop {
+                match receive_preparation(&preparation.ready, OFFER_HEARTBEAT) {
+                    Some(Ok(offer)) => break offer,
+                    Some(Err(error)) => return withdraw_offer(stream, updates, error),
+                    None => write_frame(stream, Frame::Waiting)?,
+                }
+            }
+        }
+    };
+    if preparation.is_some() {
+        stream.write_all(&frame)?;
+        stream.flush()?;
+    }
+    drop(frame);
     transfer::send(stream, &batch, progress(updates, false)).context("Sending files failed")?;
     stream.flush()?;
     let Frame::Receipt(mut summary) = read_frame(stream)? else {
@@ -489,20 +543,33 @@ fn outgoing(stream: &mut impl Io, offer: PreparedOffer, updates: &Updates) -> Re
     Ok(())
 }
 
+fn withdraw_offer(stream: &mut impl Write, updates: &Updates, error: anyhow::Error) -> Result<()> {
+    emit(updates, Event::Error(format!("{error:#}")));
+    write_frame(stream, Frame::Decline)
+}
+
+enum IncomingOffer {
+    Ready(Manifest),
+    Preview(OfferPreview),
+}
+
 fn incoming(
     stream: &mut impl Io,
-    manifest: Manifest,
+    offer: IncomingOffer,
     destination: &Path,
     requests: &mpsc::Receiver<Command>,
     updates: &Updates,
     preparation: &mut Preparation,
     cancelled: &AtomicBool,
 ) -> Result<bool> {
-    let (names, bytes) = transfer::describe(&manifest)?;
+    let (names, bytes) = match &offer {
+        IncomingOffer::Ready(manifest) => transfer::describe(manifest)?,
+        IncomingOffer::Preview(preview) => (preview.display_names()?, preview.bytes),
+    };
     emit(updates, Event::Incoming { names, bytes });
     let deadline = Instant::now() + APPROVAL_TIMEOUT;
     let to = loop {
-        match requests.recv_timeout(Duration::from_secs(1)) {
+        match requests.recv_timeout(OFFER_HEARTBEAT) {
             Ok(Command::Approve(Some(to))) => {
                 let to = if to.as_os_str().is_empty() {
                     destination
@@ -536,9 +603,43 @@ fn incoming(
             return Ok(true);
         }
         write_frame(stream, Frame::Waiting)?;
+        if matches!(&offer, IncomingOffer::Preview(_)) {
+            match read_frame(stream)? {
+                Frame::Waiting => {}
+                Frame::Decline => {
+                    emit(updates, Event::IncomingClosed { accepted: false });
+                    emit(
+                        updates,
+                        Event::Error("The sender could not prepare the batch.".into()),
+                    );
+                    return Ok(true);
+                }
+                _ => bail!("Unexpected response while reviewing the offer"),
+            }
+        }
     };
     write_frame(stream, Frame::Accept)?;
     emit(updates, Event::IncomingClosed { accepted: true });
+    let manifest = match offer {
+        IncomingOffer::Ready(manifest) => manifest,
+        IncomingOffer::Preview(preview) => loop {
+            match read_frame(stream)? {
+                Frame::Waiting => {}
+                Frame::Offer(manifest) => {
+                    preview.verify(&manifest)?;
+                    break manifest;
+                }
+                Frame::Decline => {
+                    emit(
+                        updates,
+                        Event::Error("The sender could not prepare the batch.".into()),
+                    );
+                    return Ok(true);
+                }
+                _ => bail!("Unexpected response while preparing the transfer"),
+            }
+        },
+    };
     let summary = transfer::receive(stream, &manifest, &to, cancelled, progress(updates, true))
         .context("Receiving files failed")?;
     let receipt = (|| {
@@ -564,10 +665,40 @@ struct PreparedOffer {
     frame: Vec<u8>,
 }
 
+enum OutgoingOffer {
+    Ready(PreparedOffer),
+    Preview {
+        frame: Vec<u8>,
+        preparation: PendingOffer,
+    },
+}
+
+struct PendingOffer {
+    ready: mpsc::Receiver<Result<PreparedOffer>>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Drop for PendingOffer {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
+fn receive_preparation<T>(ready: &mpsc::Receiver<Result<T>>, wait: Duration) -> Option<Result<T>> {
+    match ready.recv_timeout(wait) {
+        Ok(result) => Some(result),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Some(Err(anyhow::anyhow!(
+            "Source preparation ended unexpectedly"
+        ))),
+        Err(mpsc::RecvTimeoutError::Timeout) => None,
+    }
+}
+
 #[derive(Default)]
 struct Preparation {
-    pending: Option<mpsc::Receiver<Result<PreparedOffer>>>,
+    pending: Option<mpsc::Receiver<Result<OutgoingOffer>>>,
     cancelled: Arc<AtomicBool>,
+    previews: bool,
 }
 
 impl Preparation {
@@ -580,9 +711,31 @@ impl Preparation {
             return;
         }
         let (ready, prepared) = mpsc::channel();
+        self.cancelled = Arc::new(AtomicBool::new(false));
         let cancelled = Arc::clone(&self.cancelled);
+        let previews = self.previews;
         thread::spawn(move || {
-            let offer = transfer::prepare(&paths, &cancelled).and_then(|mut batch| {
+            let mut deferred = None;
+            let batch = if previews {
+                transfer::prepare_with_preview(&paths, &cancelled, |preview| {
+                    if preview.bytes >= MIN_PREVIEW_BYTES {
+                        let frame = encode_frame(Frame::<Manifest>::Preview(preview))?;
+                        let (complete, result) = mpsc::channel();
+                        let preparation = PendingOffer {
+                            ready: result,
+                            cancelled: Arc::clone(&cancelled),
+                        };
+                        ready
+                            .send(Ok(OutgoingOffer::Preview { frame, preparation }))
+                            .map_err(|_| anyhow::anyhow!("Transfer preparation canceled"))?;
+                        deferred = Some(complete);
+                    }
+                    Ok(())
+                })
+            } else {
+                transfer::prepare(&paths, &cancelled)
+            };
+            let offer = batch.and_then(|mut batch| {
                 let frame = match encode_frame(Frame::<&Manifest>::Offer(&batch.manifest)) {
                     Err(error) if frame_too_large(&error) && batch.omit_checkpoints() => {
                         encode_frame(Frame::<&Manifest>::Offer(&batch.manifest))
@@ -591,21 +744,19 @@ impl Preparation {
                 }?;
                 Ok(PreparedOffer { batch, frame })
             });
-            let _ = ready.send(offer);
+            if let Some(complete) = deferred {
+                let _ = complete.send(offer);
+            } else {
+                let _ = ready.send(offer.map(OutgoingOffer::Ready));
+            }
         });
         self.pending = Some(prepared);
         emit(updates, Event::Status("Preparing files…".into()));
     }
 
-    fn take_ready(&mut self, deadline: Instant) -> Option<Result<PreparedOffer>> {
+    fn take_ready(&mut self, deadline: Instant) -> Option<Result<OutgoingOffer>> {
         let wait = deadline.saturating_duration_since(Instant::now());
-        let result = match self.pending.as_ref()?.recv_timeout(wait) {
-            Ok(result) => result,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                Err(anyhow::anyhow!("Source preparation ended unexpectedly"))
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => return None,
-        };
+        let result = receive_preparation(self.pending.as_ref()?, wait)?;
         self.pending = None;
         Some(result)
     }
@@ -625,7 +776,7 @@ fn run(
     updates: &Updates,
     cancelled: &AtomicBool,
 ) -> Result<()> {
-    let (mut stream, code) = secure(tcp, client)?;
+    let (mut stream, code, previews) = secure(tcp, client)?;
     emit(updates, Event::PairCode(code));
     if !confirm(&mut stream, requests, updates)? {
         return Ok(());
@@ -633,7 +784,11 @@ fn run(
     emit(updates, Event::Paired);
 
     let mut offer_turn = client;
-    let mut preparation = Preparation::default();
+    let mut preparation = Preparation {
+        pending: None,
+        cancelled: Arc::new(AtomicBool::new(false)),
+        previews,
+    };
     while !cancelled.load(Ordering::Relaxed) {
         // Keep the idle-turn limit while waking promptly for a local
         // command or a prepared batch.
@@ -661,22 +816,24 @@ fn run(
                 write_frame(&mut stream, Frame::Idle)?;
             }
         } else {
-            match read_frame(&mut stream)? {
-                Frame::Offer(manifest) => {
-                    if !incoming(
-                        &mut stream,
-                        manifest,
-                        destination,
-                        requests,
-                        updates,
-                        &mut preparation,
-                        cancelled,
-                    )? {
-                        return Ok(());
-                    }
-                }
-                Frame::Idle => {}
+            let offer = match read_frame(&mut stream)? {
+                Frame::Offer(manifest) => Some(IncomingOffer::Ready(manifest)),
+                Frame::Preview(preview) if previews => Some(IncomingOffer::Preview(preview)),
+                Frame::Idle => None,
                 _ => bail!("Unexpected frame outside a transfer"),
+            };
+            if let Some(offer) = offer
+                && !incoming(
+                    &mut stream,
+                    offer,
+                    destination,
+                    requests,
+                    updates,
+                    &mut preparation,
+                    cancelled,
+                )?
+            {
+                return Ok(());
             }
         }
         offer_turn = !offer_turn;
@@ -806,6 +963,49 @@ mod tests {
         for peer in [left, right] {
             peer.next(|event| matches!(event, Event::Paired).then_some(()));
         }
+    }
+
+    #[test]
+    fn declining_an_early_offer_cancels_pending_preparation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("archive.bin");
+        fs::write(&source, b"payload")?;
+        let mut preview = None;
+        transfer::prepare_with_preview(&[source], &AtomicBool::new(false), |offer| {
+            preview = Some(offer);
+            Ok(())
+        })?;
+        let frame = encode_frame(Frame::<Manifest>::Preview(preview.unwrap()))?;
+        let (mut sender, mut receiver) = loopback();
+        sender.set_read_timeout(Some(Duration::from_secs(5)))?;
+        receiver.set_read_timeout(Some(Duration::from_secs(5)))?;
+        let (_complete, ready) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let preparation = PendingOffer {
+            ready,
+            cancelled: Arc::clone(&cancelled),
+        };
+        let (send, _events) = mpsc::channel();
+        let updates = Updates {
+            send,
+            notify: Box::new(|| {}),
+        };
+        thread::scope(|scope| -> Result<()> {
+            let outgoing = scope.spawn(move || {
+                outgoing(
+                    &mut sender,
+                    OutgoingOffer::Preview { frame, preparation },
+                    &updates,
+                )
+            });
+            assert!(matches!(read_frame(&mut receiver)?, Frame::Preview(_)));
+            write_frame(&mut receiver, Frame::Waiting)?;
+            assert!(matches!(read_frame(&mut receiver)?, Frame::Waiting));
+            write_frame(&mut receiver, Frame::Decline)?;
+            outgoing.join().unwrap()
+        })?;
+        assert!(cancelled.load(Ordering::Relaxed));
+        Ok(())
     }
 
     #[test]
@@ -953,10 +1153,10 @@ mod tests {
         thread::scope(|scope| -> Result<()> {
             scope.spawn(|| {
                 let result = secure(sender, true)
-                    .and_then(|(mut stream, _)| transfer::send(&mut stream, batch, |_, _| {}));
+                    .and_then(|(mut stream, _, _)| transfer::send(&mut stream, batch, |_, _| {}));
                 let _ = finished.send(result);
             });
-            let (mut stream, _) = secure(receiver, false)?;
+            let (mut stream, _, _) = secure(receiver, false)?;
             let destination = Destination::open(output)?;
             let received = transfer::receive(
                 &mut stream,

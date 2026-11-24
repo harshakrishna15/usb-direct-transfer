@@ -235,6 +235,10 @@ fn interactive(options: Options, to: &Path) -> Result<()> {
                         println!("Paired. Commands: send PATH..., pending, discard ID, quit");
                         prompt = Prompt::Ready;
                     }
+                    Event::AwaitingApproval(true) => {
+                        println!("Waiting for the other computer to approve…");
+                    }
+                    Event::AwaitingApproval(false) => {}
                     Event::Incoming { names, bytes } => {
                         println!("Incoming batch ({bytes} bytes):");
                         for name in names {
