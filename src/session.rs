@@ -140,7 +140,14 @@ pub fn start_with_notify(
                 })?;
             worker_control.attach(&stream)?;
             let _link = network::watch(&stream)?;
-            run(stream, client, &destination, &requests, &updates)
+            run(
+                stream,
+                client,
+                &destination,
+                &requests,
+                &updates,
+                &worker_control.cancelled,
+            )
         })();
         if let Err(error) = result
             && !worker_control.cancelled.load(Ordering::Relaxed)
@@ -444,6 +451,7 @@ fn incoming(
     requests: &mpsc::Receiver<Command>,
     updates: &Updates,
     preparation: &mut Preparation,
+    cancelled: &AtomicBool,
 ) -> Result<bool> {
     let (names, bytes) = transfer::describe(&manifest)?;
     emit(updates, Event::Incoming { names, bytes });
@@ -486,7 +494,7 @@ fn incoming(
     };
     write_frame(stream, Frame::Accept)?;
     emit(updates, Event::IncomingClosed { accepted: true });
-    let summary = transfer::receive(stream, &manifest, &to, progress(updates, true))
+    let summary = transfer::receive(stream, &manifest, &to, cancelled, progress(updates, true))
         .context("Receiving files failed")?;
     let receipt = (|| {
         write_frame(stream, Frame::Receipt(summary.clone()))?;
@@ -576,6 +584,7 @@ fn run(
     destination: &Path,
     requests: &mpsc::Receiver<Command>,
     updates: &Updates,
+    cancelled: &AtomicBool,
 ) -> Result<()> {
     let (mut stream, code) = secure(tcp, client)?;
     emit(updates, Event::PairCode(code));
@@ -586,7 +595,7 @@ fn run(
 
     let mut offer_turn = client;
     let mut preparation = Preparation::default();
-    loop {
+    while !cancelled.load(Ordering::Relaxed) {
         // Keep the idle-turn limit while waking promptly for a local
         // command or a prepared batch.
         let deadline = Instant::now() + POLL_INTERVAL;
@@ -622,6 +631,7 @@ fn run(
                         requests,
                         updates,
                         &mut preparation,
+                        cancelled,
                     )? {
                         return Ok(());
                     }
@@ -632,6 +642,7 @@ fn run(
         }
         offer_turn = !offer_turn;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -700,7 +711,14 @@ mod tests {
         };
         let worker_socket = socket.try_clone().unwrap();
         thread::spawn(move || {
-            if let Err(error) = run(worker_socket, client, &to, &requests, &updates) {
+            if let Err(error) = run(
+                worker_socket,
+                client,
+                &to,
+                &requests,
+                &updates,
+                &AtomicBool::new(false),
+            ) {
                 emit(&updates, Event::Error(format!("{error:#}")));
             }
             emit(&updates, Event::Disconnected);
@@ -837,6 +855,50 @@ mod tests {
         Ok(())
     }
 
+    fn receive_until_canceled(
+        batch: &Prepared,
+        output: &Path,
+        cancel_at: impl Fn(u64, u64) -> bool,
+    ) -> Result<()> {
+        let (sender, receiver) = loopback();
+        let sender_socket = sender.try_clone()?;
+        let (finished, outcome) = mpsc::channel();
+        let control = ConnectionControl::default();
+        control.attach(&receiver)?;
+        thread::scope(|scope| -> Result<()> {
+            scope.spawn(|| {
+                let result = secure(sender, true)
+                    .and_then(|(mut stream, _)| transfer::send(&mut stream, batch, |_, _| {}));
+                let _ = finished.send(result);
+            });
+            let (mut stream, _) = secure(receiver, false)?;
+            let destination = Destination::open(output)?;
+            let received = transfer::receive(
+                &mut stream,
+                &batch.manifest,
+                &destination,
+                &control.cancelled,
+                |done, total| {
+                    if cancel_at(done, total) {
+                        control.close(true);
+                    }
+                },
+            );
+            drop(stream);
+            let sent = outcome.recv_timeout(Duration::from_secs(5));
+            if sent.is_err() {
+                let _ = sender_socket.shutdown(Shutdown::Both);
+            }
+            assert!(control.cancelled.load(Ordering::Relaxed));
+            assert!(received.is_err());
+            assert!(
+                sent.context("Sender kept writing after the download was canceled")?
+                    .is_err()
+            );
+            Ok(())
+        })
+    }
+
     #[test]
     fn canceling_a_download_preserves_verified_files_and_checkpoints_for_retry() -> Result<()> {
         use std::io::{Seek, SeekFrom};
@@ -862,37 +924,8 @@ mod tests {
         drop(large);
         let batch = transfer::prepare(std::slice::from_ref(&folder), &AtomicBool::new(false))?;
 
-        let (sender, receiver) = loopback();
-        let sender_socket = sender.try_clone()?;
-        let (finished, outcome) = mpsc::channel();
-        let control = ConnectionControl::default();
-        control.attach(&receiver)?;
-        thread::scope(|scope| -> Result<()> {
-            scope.spawn(|| {
-                let result = secure(sender, true)
-                    .and_then(|(mut stream, _)| transfer::send(&mut stream, &batch, |_, _| {}));
-                let _ = finished.send(result);
-            });
-            let (mut stream, _) = secure(receiver, false)?;
-            let destination = Destination::open(&output)?;
-            let received =
-                transfer::receive(&mut stream, &batch.manifest, &destination, |done, total| {
-                    if done >= first.len() as u64 + 20 * 1024 * 1024 && done < total {
-                        control.close(true);
-                    }
-                });
-            drop(stream);
-            let sent = outcome.recv_timeout(Duration::from_secs(5));
-            if sent.is_err() {
-                let _ = sender_socket.shutdown(Shutdown::Both);
-            }
-            assert!(control.cancelled.load(Ordering::Relaxed));
-            assert!(received.is_err());
-            assert!(
-                sent.context("Sender kept writing after the download was canceled")?
-                    .is_err()
-            );
-            Ok(())
+        receive_until_canceled(&batch, &output, |done, total| {
+            done >= first.len() as u64 + 20 * 1024 * 1024 && done < total
         })?;
         assert!(!output.join("batch").exists());
         let pending = transfer::pending(&output)?;
@@ -925,6 +958,54 @@ mod tests {
         });
         assert_eq!(fs::read(output.join("batch/a.txt"))?, first);
         assert_eq!(fs::read(output.join("batch/b.bin"))?, fs::read(large_path)?);
+        assert!(transfer::pending(&output)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn canceling_after_the_last_byte_leaves_files_ready_to_retry() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        let output = root.join("right-output");
+        fs::create_dir(&output)?;
+        let source = root.join("notes.txt");
+        let data = b"received and verified";
+        fs::write(&source, data)?;
+        let batch = transfer::prepare(std::slice::from_ref(&source), &AtomicBool::new(false))?;
+
+        receive_until_canceled(&batch, &output, |done, total| done == total)?;
+        assert!(
+            !output.join("notes.txt").exists(),
+            "Canceled file was published"
+        );
+        let pending = transfer::pending(&output)?;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].bytes, data.len() as u64);
+
+        let (left, right) = connected(root);
+        pair(&left, &right);
+        left.commands.send(Command::Send(vec![source]))?;
+        right.approve_batch();
+        let reused = right.next(|event| match event {
+            Event::Progress {
+                receiving: true,
+                done,
+                ..
+            } => Some(done),
+            _ => None,
+        });
+        assert_eq!(reused, data.len() as u64);
+        right.next(|event| {
+            matches!(
+                event,
+                Event::Completed {
+                    receiving: true,
+                    ..
+                }
+            )
+            .then_some(())
+        });
+        assert_eq!(fs::read(output.join("notes.txt"))?, data);
         assert!(transfer::pending(&output)?.is_empty());
         Ok(())
     }

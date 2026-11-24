@@ -17,6 +17,7 @@ const STAGING_DIRECTORY: &str = ".usb-direct-transfer";
 const MAX_ENTRIES: usize = 100_000;
 const MAX_DEPTH: usize = 128;
 const CHUNK: usize = 1024 * 1024;
+const PUBLICATION_BATCH_SIZE: usize = 32;
 const STATE_VERSION: u32 = 1;
 const STAGING_MARKER: &[u8] = b"usb-direct-transfer staging v1\n";
 const PREPARING: usize = u32::MAX as usize;
@@ -567,6 +568,7 @@ pub(crate) fn receive(
     stream: &mut impl ReadWrite,
     manifest: &Manifest,
     to: &Destination,
+    cancelled: &AtomicBool,
     mut progress: impl FnMut(u64, u64),
 ) -> Result<Summary> {
     let (_, total) = describe(manifest)?;
@@ -575,7 +577,8 @@ pub(crate) fn receive(
     } = to;
     let stage = base.join(manifest.id()?);
     let mut next_pulse = Instant::now() + Duration::from_secs(1);
-    let mut tick = || preparing_pulse(stream, &mut next_pulse);
+    let mut tick = || preparing_pulse(stream, &mut next_pulse, cancelled);
+    tick()?;
     let mut state = if directory_exists(&stage)? {
         read_state(&stage)?
     } else {
@@ -686,6 +689,7 @@ pub(crate) fn receive(
     let mut small_files = staging_batch::Batch::default();
     let received = (|| -> Result<()> {
         for request in requests {
+            ensure!(!cancelled.load(Ordering::Relaxed), "Download canceled");
             let keep_partial = manifest.checkpoints.contains_key(&request.index);
             receive_file(
                 stream,
@@ -706,7 +710,8 @@ pub(crate) fn receive(
     // Preserve the verified members of the final group on interruption too.
     received.and(small_files.flush(&stage))?;
 
-    let mut tick = || preparing_pulse(stream, &mut next_pulse);
+    let mut tick = || preparing_pulse(stream, &mut next_pulse, cancelled);
+    tick()?;
     let mut reserved = HashSet::new();
     let mut choices_by_name = HashMap::new();
     for &index in &staged_roots {
@@ -736,19 +741,23 @@ pub(crate) fn receive(
         reserved.insert(name.clone());
         state.published[index] = Some(name);
     }
+    if staged_roots.len() < manifest.roots.len() {
+        // A previous process may have stopped between a rename and its sync.
+        sync_publication(directory, &stage)?;
+    }
     if !staged_roots.is_empty() {
         // The journal records every destination before any staged item moves.
         // The source's presence distinguishes planned items from published ones.
         write_state(&stage, &state)?;
     }
 
-    for index in staged_roots {
-        publish(
+    for group in staged_roots.chunks(PUBLICATION_BATCH_SIZE) {
+        publish_group(
             directory,
             &stage,
             &mut state,
-            index,
-            &manifest.roots[index],
+            &manifest.roots,
+            group,
             &mut tick,
         )?;
     }
@@ -771,6 +780,7 @@ pub(crate) fn receive(
             }
         }
     }
+    tick()?;
     write_integer(stream, PUBLISHED)?;
     stream.flush()?;
     // Keep the publication journal until the sender confirms receipt. A dropped
@@ -1013,42 +1023,70 @@ fn unclaimed_name(
     bail!("Too many items share the name {}", display_name(&root.name))
 }
 
-fn publish(
+fn publish_group(
     directory: &Path,
     stage: &Path,
     state: &mut State,
-    index: usize,
-    root: &Root,
+    roots: &[Root],
+    indices: &[usize],
     mut tick: impl FnMut() -> Result<()>,
 ) -> Result<()> {
-    let source = stage_item(stage, index);
-    let mut choices = publication_names(
-        compatible_name(&root.name),
-        matches!(root.entries[0].kind, Kind::Directory),
-    );
-    loop {
-        tick()?;
-        let destination = directory.join(
-            state.published[index]
-                .as_deref()
-                .context("Missing destination in the publication journal")?,
-        );
-        match rename_noreplace(&source, &destination) {
-            Ok(()) => {
-                sync_directory(directory)?;
-                sync_directory(stage)?;
-                return Ok(());
+    let mut moved = false;
+    let published = (|| -> Result<()> {
+        for &index in indices {
+            let root = &roots[index];
+            let source = stage_item(stage, index);
+            let mut choices = None;
+            loop {
+                tick()?;
+                let destination = directory.join(
+                    state.published[index]
+                        .as_deref()
+                        .context("Missing destination in the publication journal")?,
+                );
+                match rename_noreplace(&source, &destination) {
+                    Ok(()) => {
+                        moved = true;
+                        break;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        // The journal write also syncs the staging directory.
+                        // Flush earlier destinations before writing a new name.
+                        if moved {
+                            sync_publication(directory, stage)?;
+                            moved = false;
+                        }
+                        let choices = choices.get_or_insert_with(|| {
+                            publication_names(
+                                compatible_name(&root.name),
+                                matches!(root.entries[0].kind, Kind::Directory),
+                            )
+                        });
+                        let name = unclaimed_name(directory, root, choices, |_| false, &mut tick)?;
+                        state.published[index] = Some(name);
+                        write_state(stage, state)?;
+                    }
+                    Err(error) => {
+                        return Err(error).context("Cannot safely publish the received item");
+                    }
+                }
             }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                // The filesystem also detects case-equivalent names and races
-                // with other programs. Record each changed name before moving.
-                let name = unclaimed_name(directory, root, &mut choices, |_| false, &mut tick)?;
-                state.published[index] = Some(name);
-                write_state(stage, state)?;
-            }
-            Err(error) => return Err(error).context("Cannot safely publish the received item"),
         }
-    }
+        Ok(())
+    })();
+    // Finish syncing the names that moved if cancellation or an error stopped
+    // the rest of the group. The journal still covers the entire batch.
+    let synced = if moved {
+        sync_publication(directory, stage)
+    } else {
+        Ok(())
+    };
+    published.and(synced)
+}
+
+fn sync_publication(directory: &Path, stage: &Path) -> Result<()> {
+    sync_directory(directory)?;
+    sync_directory(stage)
 }
 
 fn stage_item(stage: &Path, index: usize) -> PathBuf {
@@ -1431,7 +1469,12 @@ fn matches_file(
     Ok(actual_digest == sha256 && file.metadata()?.len() == bytes)
 }
 
-fn preparing_pulse(stream: &mut impl Write, next_pulse: &mut Instant) -> Result<()> {
+fn preparing_pulse(
+    stream: &mut impl Write,
+    next_pulse: &mut Instant,
+    cancelled: &AtomicBool,
+) -> Result<()> {
+    ensure!(!cancelled.load(Ordering::Relaxed), "Download canceled");
     if Instant::now() >= *next_pulse {
         write_integer(stream, PREPARING)?;
         stream.flush()?;
@@ -1627,7 +1670,13 @@ mod tests {
         to: &Path,
         progress: impl FnMut(u64, u64),
     ) -> Result<Summary> {
-        super::receive(stream, manifest, &Destination::open(to)?, progress)
+        super::receive(
+            stream,
+            manifest,
+            &Destination::open(to)?,
+            &AtomicBool::new(false),
+            progress,
+        )
     }
 
     fn confirm_receipt(to: &Path, manifest: &Manifest) -> Result<()> {
@@ -1743,14 +1792,19 @@ mod tests {
         fs::write(stage_item(&stage, 0), "a")?;
         state.published = vec![Some("a.txt".into()), Some("b.txt".into())];
         write_state(&stage, &state)?;
-        publish(
+        let interrupted = publish_group(
             &directory,
             &stage,
             &mut state,
-            0,
-            &prepared.manifest.roots[0],
-            || Ok(()),
-        )?;
+            &prepared.manifest.roots,
+            &[0, 1],
+            || {
+                ensure!(!directory.join("a.txt").exists(), "Download canceled");
+                Ok(())
+            },
+        );
+        assert_eq!(interrupted.unwrap_err().to_string(), "Download canceled");
+        assert!(stage_item(&stage, 1).exists());
 
         fs::write(directory.join("b.txt"), "existing")?;
         let mut exchange = Exchange::new(b"b");
@@ -1779,12 +1833,12 @@ mod tests {
         write_state(&stage, &state)?;
         fs::write(directory.join("file.txt"), "existing")?;
 
-        publish(
+        publish_group(
             &directory,
             &stage,
             &mut state,
-            0,
-            &prepared.manifest.roots[0],
+            &prepared.manifest.roots,
+            &[0],
             || Ok(()),
         )?;
         assert_eq!(fs::read(directory.join("file.txt"))?, b"existing");
