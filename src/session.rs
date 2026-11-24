@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
-use transfer::{Manifest, Prepared, Summary};
+use transfer::{Destination, Manifest, Prepared, Summary};
 
 const PROTOCOL: &[u8] = b"usb-direct-transfer/1";
 const MAX_FRAME: usize = 16 * 1024 * 1024;
@@ -456,13 +456,10 @@ fn incoming(
                 } else {
                     &to
                 };
-                if to.is_dir() {
-                    break to.to_path_buf();
+                match Destination::open(to) {
+                    Ok(to) => break to,
+                    Err(error) => emit(updates, Event::Error(format!("{error:#}"))),
                 }
-                emit(
-                    updates,
-                    Event::Error("Choose an existing destination folder.".into()),
-                );
             }
             Ok(Command::Approve(None)) => {
                 write_frame(stream, Frame::Decline)?;
@@ -553,13 +550,14 @@ impl Preparation {
         emit(updates, Event::Status("Preparing files…".into()));
     }
 
-    fn take_ready(&mut self) -> Option<Result<PreparedOffer>> {
-        let result = match self.pending.as_ref()?.try_recv() {
+    fn take_ready(&mut self, deadline: Instant) -> Option<Result<PreparedOffer>> {
+        let wait = deadline.saturating_duration_since(Instant::now());
+        let result = match self.pending.as_ref()?.recv_timeout(wait) {
             Ok(result) => result,
-            Err(mpsc::TryRecvError::Disconnected) => {
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
                 Err(anyhow::anyhow!("Source preparation ended unexpectedly"))
             }
-            Err(mpsc::TryRecvError::Empty) => return None,
+            Err(mpsc::RecvTimeoutError::Timeout) => return None,
         };
         self.pending = None;
         Some(result)
@@ -589,13 +587,21 @@ fn run(
     let mut offer_turn = client;
     let mut preparation = Preparation::default();
     loop {
-        match requests.try_recv() {
+        // Keep the idle-turn limit while waking promptly for a local
+        // command or a prepared batch.
+        let deadline = Instant::now() + POLL_INTERVAL;
+        let wait = if offer_turn && preparation.pending.is_none() {
+            POLL_INTERVAL
+        } else {
+            Duration::ZERO
+        };
+        match requests.recv_timeout(wait) {
             Ok(Command::Send(paths)) => preparation.queue(paths, updates),
-            Ok(Command::Disconnect) | Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
-            Ok(_) | Err(mpsc::TryRecvError::Empty) => {}
+            Ok(Command::Disconnect) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            Ok(_) | Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
         if offer_turn {
-            if let Some(result) = preparation.take_ready() {
+            if let Some(result) = preparation.take_ready(deadline) {
                 match result {
                     Ok(batch) => outgoing(&mut stream, batch, updates)?,
                     Err(error) => {
@@ -620,7 +626,7 @@ fn run(
                         return Ok(());
                     }
                 }
-                Frame::Idle => thread::sleep(POLL_INTERVAL),
+                Frame::Idle => {}
                 _ => bail!("Unexpected frame outside a transfer"),
             }
         }
@@ -746,6 +752,46 @@ mod tests {
     }
 
     #[test]
+    fn unavailable_save_folder_keeps_the_offer_open() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("photo.jpg");
+        fs::write(&source, b"picture")?;
+        let unavailable = temp.path().join("unavailable");
+        fs::create_dir_all(unavailable.join(".usb-direct-transfer"))?;
+
+        let (left, right) = connected(temp.path());
+        pair(&left, &right);
+        left.commands.send(Command::Send(vec![source]))?;
+        right.next(|event| matches!(event, Event::Incoming { .. }).then_some(()));
+        right.commands.send(Command::Approve(Some(unavailable)))?;
+        let error = loop {
+            match right.events.recv_timeout(Duration::from_secs(30))? {
+                Event::Error(error) => break error,
+                Event::IncomingClosed { .. } | Event::Disconnected => {
+                    bail!("An unavailable destination closed the offer")
+                }
+                _ => {}
+            }
+        };
+        assert!(error.contains("Unrecognized staging folder"), "{error}");
+
+        right
+            .commands
+            .send(Command::Approve(Some(PathBuf::new())))?;
+        for (peer, receiving_side) in [(&right, true), (&left, false)] {
+            peer.next(|event| {
+                matches!(event, Event::Completed { receiving, .. } if receiving == receiving_side)
+                    .then_some(())
+            });
+        }
+        assert_eq!(
+            fs::read(temp.path().join("right-output/photo.jpg"))?,
+            b"picture"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn oversized_offer_does_not_end_the_session() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let source = temp.path().join("photos");
@@ -828,8 +874,9 @@ mod tests {
                 let _ = finished.send(result);
             });
             let (mut stream, _) = secure(receiver, false)?;
+            let destination = Destination::open(&output)?;
             let received =
-                transfer::receive(&mut stream, &batch.manifest, &output, |done, total| {
+                transfer::receive(&mut stream, &batch.manifest, &destination, |done, total| {
                     if done >= first.len() as u64 + 20 * 1024 * 1024 && done < total {
                         control.close(true);
                     }

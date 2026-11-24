@@ -543,22 +543,43 @@ struct FileRequest<'a> {
     offset: u64,
 }
 
-pub fn receive(
+pub(crate) struct Destination {
+    directory: PathBuf,
+    base: PathBuf,
+    // Hold the staging lock through publication and receipt confirmation.
+    _lock: File,
+}
+
+impl Destination {
+    pub(crate) fn open(to: &Path) -> Result<Self> {
+        let (directory, base) = staging_base(to, true)
+            .with_context(|| format!("Cannot prepare {} for receiving", display_path(to)))?;
+        let lock = lock_staging(&base)?;
+        Ok(Self {
+            directory,
+            base,
+            _lock: lock,
+        })
+    }
+}
+
+pub(crate) fn receive(
     stream: &mut impl ReadWrite,
     manifest: &Manifest,
-    to: &Path,
+    to: &Destination,
     mut progress: impl FnMut(u64, u64),
 ) -> Result<Summary> {
     let (_, total) = describe(manifest)?;
-    let (directory, base) = staging_base(to, true)?;
-    let _lock = lock_staging(&base)?;
+    let Destination {
+        directory, base, ..
+    } = to;
     let stage = base.join(manifest.id()?);
     let mut next_pulse = Instant::now() + Duration::from_secs(1);
     let mut tick = || preparing_pulse(stream, &mut next_pulse);
     let mut state = if directory_exists(&stage)? {
         read_state(&stage)?
     } else {
-        initialize_stage(&base, &stage, manifest, &mut tick)?
+        initialize_stage(base, &stage, manifest, &mut tick)?
     };
     validate_state(&state, manifest)?;
     remove_temporary_entries(&stage, ".partial-")?;
@@ -706,7 +727,7 @@ pub fn receive(
             .entry((compatible_name(&root.name), folder))
             .or_insert_with_key(|(name, folder)| publication_names(name.clone(), *folder));
         let name = unclaimed_name(
-            &directory,
+            directory,
             root,
             choices,
             |candidate| reserved.contains(candidate),
@@ -723,7 +744,7 @@ pub fn receive(
 
     for index in staged_roots {
         publish(
-            &directory,
+            directory,
             &stage,
             &mut state,
             index,
@@ -825,10 +846,9 @@ fn receive_file(
     sync_directory(path.parent().context("Missing staging parent")?)
 }
 
-pub(crate) fn confirm_receipt(to: &Path, manifest: &Manifest) -> Result<()> {
-    let (_, base) = staging_base(to, false)?;
-    verify_marker(&base)?;
-    let _lock = lock_staging(&base)?;
+pub(crate) fn confirm_receipt(to: &Destination, manifest: &Manifest) -> Result<()> {
+    let base = &to.base;
+    verify_marker(base)?;
     let stage = base.join(manifest.id()?);
     if !directory_exists(&stage)? {
         return Ok(());
@@ -842,7 +862,7 @@ pub(crate) fn confirm_receipt(to: &Path, manifest: &Manifest) -> Result<()> {
         );
     }
     fs::remove_dir_all(&stage)?;
-    sync_directory(&base)
+    sync_directory(base)
 }
 
 pub fn pending(to: &Path) -> Result<Vec<Pending>> {
@@ -1599,6 +1619,19 @@ mod tests {
 
     fn prepare(paths: &[PathBuf]) -> Result<Prepared> {
         super::prepare(paths, &AtomicBool::new(false))
+    }
+
+    fn receive(
+        stream: &mut impl ReadWrite,
+        manifest: &Manifest,
+        to: &Path,
+        progress: impl FnMut(u64, u64),
+    ) -> Result<Summary> {
+        super::receive(stream, manifest, &Destination::open(to)?, progress)
+    }
+
+    fn confirm_receipt(to: &Path, manifest: &Manifest) -> Result<()> {
+        super::confirm_receipt(&Destination::open(to)?, manifest)
     }
 
     #[derive(Default)]
